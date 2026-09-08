@@ -1,0 +1,12 @@
+---
+# Smallest working configuration with the bundled Redis: an external
+# PostgreSQL, and credentials supplied inline instead of through a Secret you
+# manage yourself. The values below are throwaway test data, not defaults.
+postgresql:
+  host: postgres.databases.svc.cluster.local
+
+auth:
+  databasePassword: test-database-password
+  redisPassword: test-redis-password
+  jwtSecret: 4a1c1cf9f1f9f0dd3a2b9f6d7f7f1e8ca7b1e0c6d5a4938271605f4e3d2c1b0a
+  totpEncryptionKey: 0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0

@@ -1,0 +1,167 @@
+# Builds the Sub2API container image and publishes it to the GitHub Container
+# Registry package that belongs to this repository's owner.
+#
+# Authentication uses the built-in GITHUB_TOKEN, so the workflow is
+# self-sufficient: no repository secret has to be created by hand.
+#
+# TRIGGERS ARE DELIBERATELY PUSH-ONLY. The job runs on a self-hosted runner
+# whose Docker daemon is privileged; `pull_request`, `pull_request_target`,
+# `workflow_run` and `issue_comment` triggers would let code from an
+# unreviewed fork execute on that host and MUST NOT be added here.
+#
+# Note: this repository also carries `release.yml`, which publishes GHCR images
+# through GoReleaser on `v*` tags. If both are enabled, a tag push builds the
+# same image twice; disable one of them for the tag event you care about.
+name: Publish image to GHCR
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      push_image:
+        description: Push the image to GHCR (uncheck for a build-only dry run)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ghcr-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # Actions Runner Controller scale set on the owner's cluster. It is
+    # linux/amd64 only and CPU-tight, so this job builds a single architecture
+    # and never emulates one under QEMU.
+    runs-on: pure-vps-linux-x64-sub2api
+    timeout-minutes: 90
+
+    env:
+      REGISTRY: ghcr.io
+      # ghcr.io/<owner>/<repo>, lowercased below because image references may
+      # not contain uppercase characters.
+      PUSH_IMAGE: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+      PLATFORMS: linux/amd64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve image name and build metadata
+        id: meta_inputs
+        env:
+          OWNER_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          image="$(printf '%s' "${REGISTRY}/${OWNER_REPO}" | tr '[:upper:]' '[:lower:]')"
+
+          version=""
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          fi
+
+          {
+            echo "image=${image}"
+            echo "version=${version}"
+            echo "revision=$(git rev-parse HEAD)"
+            echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >>"$GITHUB_OUTPUT"
+
+          echo "Image:     ${image}"
+          echo "Version:   ${version:-<untagged build>}"
+          echo "Push:      ${PUSH_IMAGE}"
+          echo "Platforms: ${PLATFORMS}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.meta_inputs.outputs.image }}
+          labels: |
+            org.opencontainers.image.title=Sub2API
+            org.opencontainers.image.description=AI API gateway platform for subscription quota distribution
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.meta_inputs.outputs.revision }}
+            org.opencontainers.image.created=${{ steps.meta_inputs.outputs.created }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=branch
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=edge,enable={{is_default_branch}}
+
+      - name: Log in to GHCR
+        if: env.PUSH_IMAGE == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          push: ${{ env.PUSH_IMAGE == 'true' }}
+          load: ${{ env.PUSH_IMAGE != 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # The Dockerfile defaults GOPROXY/GOSUMDB to the mainland-China
+          # mirrors; override them for a runner outside that network.
+          build-args: |
+            VERSION=${{ steps.meta_inputs.outputs.version }}
+            COMMIT=${{ steps.meta_inputs.outputs.revision }}
+            DATE=${{ steps.meta_inputs.outputs.created }}
+            GOPROXY=https://proxy.golang.org,direct
+            GOSUMDB=sum.golang.org
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Summary
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          {
+            if [ "${PUSH_IMAGE}" = "true" ]; then
+              echo "### Published to GHCR"
+            else
+              echo "### Build-only run — nothing was pushed"
+            fi
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Digest | \`${IMAGE_DIGEST:-n/a}\` |"
+            echo "| Platforms | \`${PLATFORMS}\` |"
+            echo
+            echo "Tags:"
+            echo
+            printf '%s\n' "${IMAGE_TAGS}" | while IFS= read -r tag; do
+              [ -n "${tag}" ] && printf -- '- %s\n' "${tag}"
+            done
+            echo
+            echo "A GHCR package is **private** when it is first created."
+            echo "Make it public once, under Packages -> sub2api -> Package settings"
+            echo "-> Change visibility, or an anonymous \`docker pull\` will fail."
+          } >>"$GITHUB_STEP_SUMMARY"
