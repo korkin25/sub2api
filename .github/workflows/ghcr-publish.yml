@@ -12,6 +12,12 @@
 # Note: this repository also carries `release.yml`, which publishes GHCR images
 # through GoReleaser on `v*` tags. If both are enabled, a tag push builds the
 # same image twice; disable one of them for the tag event you care about.
+#
+# The `chart` job additionally publishes deploy/helm/sub2api as an OCI artifact
+# to oci://ghcr.io/<owner>/charts/sub2api. That exists so a GitOps controller
+# can pull just the chart: resolving this chart from a `GitRepository` source
+# clones the whole ~107 MB repository, which is more than a memory-capped
+# source-controller can absorb.
 name: Publish image to GHCR
 
 on:
@@ -164,4 +170,170 @@ jobs:
             echo "A GHCR package is **private** when it is first created."
             echo "Make it public once, under Packages -> sub2api -> Package settings"
             echo "-> Change visibility, or an anonymous \`docker pull\` will fail."
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  chart:
+    name: Package and publish Helm chart
+    # Same self-hosted scale set as the image job, for the same reasons.
+    runs-on: pure-vps-linux-x64-sub2api
+    timeout-minutes: 15
+    # The chart's `image.tag` falls back to .Chart.AppVersion, so a chart is
+    # only worth publishing once the image it points at has actually been
+    # pushed. A failed image build must not leave a dangling chart behind.
+    needs: publish
+
+    env:
+      CHART_DIR: deploy/helm/sub2api
+      # Mirrors the image job's dry-run switch, so `workflow_dispatch` with
+      # `push_image` unchecked packages the chart but publishes nothing.
+      PUSH_CHART: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v4.2.3
+
+      - name: Resolve chart version
+        id: chart
+        run: |
+          set -euo pipefail
+
+          # Base version declared in Chart.yaml, stripped of any pre-release or
+          # build-metadata suffix so we can append our own.
+          base="$(awk '$1 == "version:" { gsub(/"/, "", $2); print $2; exit }' "${CHART_DIR}/Chart.yaml")"
+          base="${base%%-*}"
+          base="${base%%+*}"
+          if [ -z "${base}" ]; then
+            echo "::error::could not read version: from ${CHART_DIR}/Chart.yaml"
+            exit 1
+          fi
+
+          # A chart version MUST be valid SemVer, and it must be unique: a
+          # registry happily overwrites an existing tag, and Flux would then
+          # keep serving whatever it cached first.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            # Release build. `v1.2.3` -> chart 1.2.3, matching the image tag
+            # that docker/metadata-action produced from the same tag.
+            version="${GITHUB_REF_NAME#v}"
+            app_version="${version}"
+          else
+            # Branch build. SemVer pre-release, so it sorts *below* the eventual
+            # release of the same base version. The run number keeps ordering
+            # monotonic and the `g`-prefixed short SHA keeps it unique and
+            # non-numeric (a bare numeric identifier with a leading zero would
+            # be invalid SemVer).
+            slug="$(printf '%s' "${GITHUB_REF_NAME}" | sed 's/[^0-9A-Za-z-]/-/g')"
+            version="${base}-${slug}.${GITHUB_RUN_NUMBER}.g${GITHUB_SHA:0:7}"
+            # appVersion is left as declared in Chart.yaml on branch builds.
+            app_version=""
+          fi
+
+          {
+            echo "version=${version}"
+            echo "app_version=${app_version}"
+          } >>"$GITHUB_OUTPUT"
+
+          echo "Chart version: ${version}"
+          echo "appVersion:    ${app_version:-<as declared in Chart.yaml>}"
+          echo "Push:          ${PUSH_CHART}"
+
+      - name: Package chart
+        id: package
+        env:
+          CHART_VERSION: ${{ steps.chart.outputs.version }}
+          CHART_APP_VERSION: ${{ steps.chart.outputs.app_version }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+
+          # `helm package` does not render templates, so it needs none of the
+          # credentials this chart demands at install time. It does validate the
+          # SemVer we just built, and fails loudly if it is malformed.
+          if [ -n "${CHART_APP_VERSION}" ]; then
+            helm package "${CHART_DIR}" \
+              --version "${CHART_VERSION}" \
+              --app-version "${CHART_APP_VERSION}" \
+              --destination dist
+          else
+            helm package "${CHART_DIR}" \
+              --version "${CHART_VERSION}" \
+              --destination dist
+          fi
+
+          # Glob rather than `ls`, so the name never round-trips through
+          # word splitting.
+          shopt -s nullglob
+          packaged=(dist/*.tgz)
+          if [ "${#packaged[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one packaged chart, got ${#packaged[@]}"
+            exit 1
+          fi
+
+          echo "file=${packaged[0]}" >>"$GITHUB_OUTPUT"
+          echo "Packaged ${packaged[0]}"
+
+      - name: Log in to GHCR
+        if: env.PUSH_CHART == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Same built-in credential the image job uses; `packages: write` is
+          # already granted above. No repository secret is involved.
+          printf '%s' "${GITHUB_TOKEN}" \
+            | helm registry login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Push chart
+        id: push
+        if: env.PUSH_CHART == 'true'
+        env:
+          CHART_FILE: ${{ steps.package.outputs.file }}
+        run: |
+          set -euo pipefail
+
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          repo="oci://ghcr.io/${owner}/charts"
+
+          helm push "${CHART_FILE}" "${repo}"
+
+          echo "ref=${repo}/sub2api" >>"$GITHUB_OUTPUT"
+
+      - name: Log out of GHCR
+        if: always()
+        run: helm registry logout ghcr.io || true
+
+      - name: Summary
+        env:
+          CHART_REF: ${{ steps.push.outputs.ref }}
+          CHART_VERSION: ${{ steps.chart.outputs.version }}
+        run: |
+          set -euo pipefail
+          {
+            if [ "${PUSH_CHART}" = "true" ]; then
+              echo "### Helm chart published"
+              echo
+              echo "\`${CHART_REF}:${CHART_VERSION}\`"
+              echo
+              echo "Consume it from Flux without cloning this repository:"
+              echo '```yaml'
+              echo "apiVersion: source.toolkit.fluxcd.io/v1"
+              echo "kind: HelmRepository"
+              echo "spec:"
+              echo "  type: oci"
+              echo "  url: ${CHART_REF%/sub2api}"
+              echo '```'
+              echo
+              echo "A GHCR package is **private** when it is first created."
+              echo "Make \`charts/sub2api\` public once under the owner's package"
+              echo "settings, or an anonymous pull will fail."
+            else
+              echo "### Chart packaged only — nothing was pushed"
+              echo
+              echo "Version: \`${CHART_VERSION}\`"
+            fi
           } >>"$GITHUB_STEP_SUMMARY"
