@@ -228,8 +228,15 @@ jobs:
             # be invalid SemVer).
             slug="$(printf '%s' "${GITHUB_REF_NAME}" | sed 's/[^0-9A-Za-z-]/-/g')"
             version="${base}-${slug}.${GITHUB_RUN_NUMBER}.g${GITHUB_SHA:0:7}"
-            # appVersion is left as declared in Chart.yaml on branch builds.
-            app_version=""
+            # appVersion must describe what actually runs, not what Chart.yaml
+            # happens to declare. On a branch build the image is built from this
+            # commit, which can be far ahead of the last release: at the time of
+            # writing, main is 71 commits and 269 files past v0.2.3, including
+            # backend/ent/migrate/schema.go, so a chart claiming appVersion
+            # 0.2.3 would put a wrong app.kubernetes.io/version on every object
+            # and invite someone to assume release semantics that do not hold.
+            # Use the same short SHA the image is tagged with instead.
+            app_version="main-${GITHUB_SHA:0:7}"
           fi
 
           {
