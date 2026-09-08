@@ -1,0 +1,160 @@
+{{- /*
+Bundled single-node Redis, deployed only when `redis.enabled` is true. It is a
+convenience for small installations, not a highly available Redis: point
+`redis.host` at a managed service or a dedicated Redis chart when you need one.
+*/ -}}
+{{- if .Values.redis.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sub2api.redis.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sub2api.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  type: ClusterIP
+  ports:
+    - name: redis
+      port: {{ .Values.redis.port }}
+      targetPort: redis
+      protocol: TCP
+  selector:
+    {{- include "sub2api.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "sub2api.redis.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sub2api.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  serviceName: {{ include "sub2api.redis.fullname" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "sub2api.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: redis
+  template:
+    metadata:
+      labels:
+        {{- include "sub2api.labels" . | nindent 8 }}
+        app.kubernetes.io/component: redis
+      {{- with .Values.redis.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "sub2api.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.redis.podSecurityContext | nindent 8 }}
+      containers:
+        - name: redis
+          image: {{ include "sub2api.redis.image" . }}
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.redis.securityContext | nindent 12 }}
+          # The image entrypoint is bypassed on purpose: the Pod already runs as
+          # the redis account, and the password has to be expanded by a shell.
+          command:
+            - sh
+            - -c
+          args:
+            - |
+              exec redis-server \
+                --save 60 1 \
+                --appendonly {{ ternary "yes" "no" .Values.redis.persistence.enabled }} \
+                --appendfsync everysec \
+                --dir /data \
+                --requirepass "$REDIS_PASSWORD"
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sub2api.secretName" . }}
+                  key: {{ .Values.auth.keys.redisPassword }}
+            # redis-cli reads this, so the probes below never carry the
+            # password on a command line.
+            - name: REDISCLI_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sub2api.secretName" . }}
+                  key: {{ .Values.auth.keys.redisPassword }}
+            - name: TZ
+              value: {{ .Values.config.timezone | quote }}
+          ports:
+            - name: redis
+              containerPort: {{ .Values.redis.port }}
+              protocol: TCP
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli -e ping | grep -q PONG
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli -e ping | grep -q PONG
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      {{- if not .Values.redis.persistence.enabled }}
+      volumes:
+        - name: data
+          emptyDir: {}
+      {{- end }}
+      {{- with .Values.redis.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.redis.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.redis.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.redis.persistence.enabled }}
+  # volumeClaimTemplates survive `helm uninstall`, which is what keeps the
+  # append-only file across an uninstall/reinstall. They are also immutable
+  # after creation, so only stable labels go here — `helm.sh/chart` carries the
+  # chart version and would make every version bump a rejected update.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "sub2api.selectorLabels" . | nindent 10 }}
+          app.kubernetes.io/component: redis
+      spec:
+        accessModes:
+          {{- toYaml .Values.redis.persistence.accessModes | nindent 10 }}
+        {{- if .Values.redis.persistence.storageClass }}
+        storageClassName: {{ .Values.redis.persistence.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.redis.persistence.size }}
+  {{- end }}
+{{- end }}

@@ -1,0 +1,52 @@
+{{- /*
+Non-secret runtime configuration only. Upstream resolves configuration as
+environment > config.yaml > defaults, so these values keep winning over the
+config.yaml the first run writes onto the data volume.
+*/ -}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sub2api.fullname" . }}-env
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sub2api.labels" . | nindent 4 }}
+data:
+  # Required for a container deployment: no interactive setup wizard.
+  AUTO_SETUP: "true"
+  SERVER_HOST: "0.0.0.0"
+  SERVER_PORT: {{ .Values.service.port | quote }}
+  SERVER_MODE: {{ .Values.config.serverMode | quote }}
+  RUN_MODE: {{ .Values.config.runMode | quote }}
+  TZ: {{ .Values.config.timezone | quote }}
+
+  LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  LOG_FORMAT: {{ .Values.config.logFormat | quote }}
+  LOG_OUTPUT_TO_STDOUT: {{ .Values.config.logToStdout | quote }}
+  LOG_OUTPUT_TO_FILE: {{ .Values.config.logToFile | quote }}
+
+  DATABASE_HOST: {{ .Values.postgresql.host | quote }}
+  DATABASE_PORT: {{ .Values.postgresql.port | quote }}
+  DATABASE_USER: {{ .Values.postgresql.username | quote }}
+  DATABASE_DBNAME: {{ .Values.postgresql.database | quote }}
+  DATABASE_SSLMODE: {{ .Values.postgresql.sslMode | quote }}
+  DATABASE_MAX_OPEN_CONNS: {{ .Values.postgresql.maxOpenConns | quote }}
+  DATABASE_MAX_IDLE_CONNS: {{ .Values.postgresql.maxIdleConns | quote }}
+  DATABASE_CONN_MAX_LIFETIME_MINUTES: {{ .Values.postgresql.connMaxLifetimeMinutes | quote }}
+  DATABASE_CONN_MAX_IDLE_TIME_MINUTES: {{ .Values.postgresql.connMaxIdleTimeMinutes | quote }}
+
+  REDIS_HOST: {{ include "sub2api.redis.host" . | quote }}
+  REDIS_PORT: {{ .Values.redis.port | quote }}
+  REDIS_DB: {{ .Values.redis.db | quote }}
+  REDIS_USERNAME: {{ .Values.redis.username | quote }}
+  REDIS_POOL_SIZE: {{ .Values.redis.poolSize | quote }}
+  REDIS_MIN_IDLE_CONNS: {{ .Values.redis.minIdleConns | quote }}
+  REDIS_ENABLE_TLS: {{ .Values.redis.enableTls | quote }}
+
+  ADMIN_EMAIL: {{ .Values.config.adminEmail | quote }}
+  JWT_EXPIRE_HOUR: {{ .Values.config.jwtExpireHour | quote }}
+  SETUP_MIGRATION_TIMEOUT_SECONDS: {{ .Values.config.setupMigrationTimeoutSeconds | quote }}
+
+  SECURITY_URL_ALLOWLIST_ENABLED: {{ .Values.config.security.urlAllowlistEnabled | quote }}
+  SECURITY_URL_ALLOWLIST_ALLOW_INSECURE_HTTP: {{ .Values.config.security.urlAllowlistAllowInsecureHttp | quote }}
+  SECURITY_URL_ALLOWLIST_ALLOW_PRIVATE_HOSTS: {{ .Values.config.security.urlAllowlistAllowPrivateHosts | quote }}

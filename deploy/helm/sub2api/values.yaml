@@ -1,0 +1,300 @@
+---
+# Default values for the sub2api chart.
+#
+# NO CREDENTIAL HAS A DEFAULT IN THIS FILE. Either point `auth.existingSecret`
+# at a Secret you manage yourself, or set the `auth.*` values explicitly. The
+# chart refuses to render when a required credential is missing.
+#
+# Minimum set of values you must supply for a working release:
+#   postgresql.host
+#   auth.existingSecret        (or auth.databasePassword + auth.jwtSecret +
+#                               auth.totpEncryptionKey [+ auth.redisPassword])
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  # Container image for the gateway.
+  # Upstream publishes docker.io/weishaw/sub2api and ghcr.io/wei-shaw/sub2api;
+  # this fork publishes ghcr.io/korkin25/sub2api from
+  # .github/workflows/ghcr-publish.yml.
+  repository: ghcr.io/korkin25/sub2api
+  # Empty means "use .Chart.AppVersion". Ignored when `digest` is set.
+  tag: ""
+  # Optional. When set, the image is referenced by digest instead of by tag,
+  # e.g. sha256:0123... Recommended for production.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# The application keeps its generated config.yaml on a ReadWriteOnce volume and
+# owns scheduler / sticky-session state; upstream documents no multi-instance
+# mode. Raise this only if you know your deployment tolerates it.
+replicaCount: 1
+
+# `Recreate`, not `RollingUpdate`: with a ReadWriteOnce data volume a rolling
+# update deadlocks waiting for the old Pod to release the PVC.
+strategy: Recreate
+
+# -----------------------------------------------------------------------------
+# Credentials
+# -----------------------------------------------------------------------------
+auth:
+  # Name of a pre-existing Secret holding the credentials below. When set, no
+  # Secret is created by the chart and every `auth.<name>` value is ignored.
+  # Useful with External Secrets Operator, sealed-secrets, SOPS, and so on.
+  existingSecret: ""
+
+  # Keys read from `existingSecret` (or written into the Secret the chart
+  # creates). Change these to match a Secret you already have.
+  keys:
+    databasePassword: DATABASE_PASSWORD
+    redisPassword: REDIS_PASSWORD
+    jwtSecret: JWT_SECRET
+    totpEncryptionKey: TOTP_ENCRYPTION_KEY
+    adminPassword: ADMIN_PASSWORD
+
+  # Inline credentials. Only read when `existingSecret` is empty.
+  #
+  # Required: databasePassword, jwtSecret, totpEncryptionKey — plus
+  # redisPassword whenever the bundled Redis is enabled.
+  #
+  #   jwtSecret          openssl rand -hex 32
+  #   totpEncryptionKey  openssl rand -hex 32   (exactly 64 hex characters:
+  #                                              it is an AES-256 key, and
+  #                                              changing it invalidates every
+  #                                              stored TOTP enrolment)
+  databasePassword: ""
+  redisPassword: ""
+  jwtSecret: ""
+  totpEncryptionKey: ""
+  # Optional. Left empty, the application generates an admin password on first
+  # run and prints it once in the Pod log.
+  adminPassword: ""
+
+# -----------------------------------------------------------------------------
+# External PostgreSQL (required — the chart does not ship a database)
+# -----------------------------------------------------------------------------
+# PostgreSQL 14 or newer. The application applies its own migrations at startup
+# with bounded exponential backoff, so the role needs DDL rights on the schema.
+postgresql:
+  # Hostname or Service name. REQUIRED.
+  host: ""
+  port: 5432
+  database: sub2api
+  username: sub2api
+  # Passed straight through to the pgx DSN: disable | allow | prefer |
+  # require | verify-ca | verify-full.
+  sslMode: require
+  maxOpenConns: 20
+  maxIdleConns: 5
+  connMaxLifetimeMinutes: 30
+  connMaxIdleTimeMinutes: 5
+
+# -----------------------------------------------------------------------------
+# Redis 6+
+# -----------------------------------------------------------------------------
+redis:
+  # true  -> the chart deploys the bundled single-node Redis StatefulSet below
+  #          and points the application at it.
+  # false -> set `redis.host` to an external Redis (a managed service, a
+  #          bitnami/redis release, a Redis operator, ...).
+  enabled: true
+
+  # Connection settings. `host` is REQUIRED when `enabled` is false and is
+  # ignored when it is true.
+  host: ""
+  port: 6379
+  db: 0
+  # Redis ACL user. Empty means the default user.
+  username: ""
+  enableTls: false
+  poolSize: 256
+  minIdleConns: 8
+
+  # Everything below only applies to the bundled Redis.
+  image:
+    repository: docker.io/library/redis
+    tag: "8-alpine"
+    digest: ""
+    pullPolicy: IfNotPresent
+  persistence:
+    enabled: true
+    # Empty means the cluster's default StorageClass.
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    size: 2Gi
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+  # The official redis images create the `redis` account as uid/gid 999.
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 999
+    runAsGroup: 999
+    fsGroup: 999
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# -----------------------------------------------------------------------------
+# Application configuration
+# -----------------------------------------------------------------------------
+# Upstream resolves configuration as environment > config.yaml > defaults, so
+# everything here keeps winning over the config.yaml written on the first run.
+config:
+  # Upstream's own default is Asia/Shanghai; it drives statistics day
+  # boundaries, so set it to whatever your reporting expects.
+  timezone: UTC
+  serverMode: release
+  runMode: standard
+  logLevel: info
+  logFormat: json
+  logToStdout: true
+  logToFile: false
+  jwtExpireHour: 24
+  # 0 selects the application's built-in default for the startup migration
+  # timeout.
+  setupMigrationTimeoutSeconds: 0
+  # Login identity of the bootstrap admin account. The password comes from
+  # `auth`, never from this file.
+  adminEmail: admin@sub2api.local
+  security:
+    urlAllowlistEnabled: false
+    urlAllowlistAllowInsecureHttp: false
+    urlAllowlistAllowPrivateHosts: false
+
+# Extra non-secret environment variables, e.g. GATEWAY_* tuning from
+# deploy/.env.example. Never put credentials here.
+extraEnv: []
+#  - name: GATEWAY_MAX_IDLE_CONNS
+#    value: "512"
+
+# Extra envFrom sources, e.g. a Secret holding provider OAuth client secrets.
+extraEnvFrom: []
+#  - secretRef:
+#      name: sub2api-providers
+
+# -----------------------------------------------------------------------------
+# Storage
+# -----------------------------------------------------------------------------
+# The application writes its generated config.yaml (and, with file logging on,
+# its logs) under /app/data. Losing that directory forces a fresh setup.
+persistence:
+  enabled: true
+  # Empty means the cluster's default StorageClass.
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 2Gi
+  # Bind an existing PVC instead of creating one.
+  existingClaim: ""
+  annotations: {}
+
+# /tmp backing, needed because the root filesystem is read-only.
+tmpDirSizeLimit: 64Mi
+
+# -----------------------------------------------------------------------------
+# Networking
+# -----------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 8080
+  nodePort: ""
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: sub2api.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: sub2api-tls
+  #    hosts:
+  #      - sub2api.local
+
+# -----------------------------------------------------------------------------
+# Workload
+# -----------------------------------------------------------------------------
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automountServiceAccountToken: false
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 1Gi
+
+# The upstream image adds uid/gid 1000 as `sub2api`. Entering as that uid makes
+# the image entrypoint skip its root chown branch and exec the binary directly,
+# which is what the `restricted` Pod Security Standard requires.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+healthPath: /health
+
+# Migrations run in-process at startup with bounded exponential backoff, so the
+# startup budget has to cover a database that is still coming up.
+# 60 x 10s = 10 minutes before the Pod is declared failed.
+startupProbe:
+  enabled: true
+  periodSeconds: 10
+  failureThreshold: 60
+  timeoutSeconds: 5
+
+readinessProbe:
+  enabled: true
+  periodSeconds: 10
+  failureThreshold: 3
+  timeoutSeconds: 5
+
+# Deliberately slack: upstream warns not to let a database recovery window read
+# as a permanent process failure.
+livenessProbe:
+  enabled: true
+  periodSeconds: 30
+  failureThreshold: 10
+  timeoutSeconds: 10
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+terminationGracePeriodSeconds: 60

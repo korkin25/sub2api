@@ -1,0 +1,21 @@
+---
+apiVersion: v2
+name: sub2api
+description: Sub2API — AI API gateway platform for subscription quota distribution
+type: application
+# Chart version. Bump on every change to the chart itself.
+version: 0.1.0
+# Application version the chart defaults to. Also the fallback for
+# `image.tag` when that value is left empty.
+appVersion: "0.2.3"
+kubeVersion: ">=1.23.0-0"
+home: https://github.com/Wei-Shaw/sub2api
+icon: https://raw.githubusercontent.com/Wei-Shaw/sub2api/main/assets/logo.svg
+sources:
+  - https://github.com/Wei-Shaw/sub2api
+keywords:
+  - ai
+  - api-gateway
+  - claude
+  - codex
+  - subscription
