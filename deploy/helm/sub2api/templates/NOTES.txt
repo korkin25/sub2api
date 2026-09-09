@@ -1,0 +1,36 @@
+sub2api {{ .Chart.AppVersion }} released as {{ include "sub2api.fullname" . }} in namespace {{ .Release.Namespace }}.
+
+  Image:     {{ include "sub2api.image" . }}
+  Service:   {{ include "sub2api.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }} ({{ .Values.service.type }})
+  Database:  {{ .Values.postgresql.username }}@{{ .Values.postgresql.host }}:{{ .Values.postgresql.port }}/{{ .Values.postgresql.database }} (sslmode={{ .Values.postgresql.sslMode }})
+  Redis:     {{ include "sub2api.redis.host" . }}:{{ .Values.redis.port }} ({{ if .Values.redis.enabled }}bundled by this chart{{ else }}external{{ end }})
+  Secret:    {{ include "sub2api.secretName" . }} ({{ if .Values.auth.existingSecret }}pre-existing, not managed by this chart{{ else }}created by this chart{{ end }})
+
+On the first start the application applies its SQL migrations, writes
+config.yaml onto the data volume and creates the admin account
+{{ .Values.config.adminEmail }}.
+{{- if and (not .Values.auth.existingSecret) (not .Values.auth.adminPassword) }}
+
+  No admin password was supplied, so one is generated on the first run and
+  printed once in the log:
+
+    kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "sub2api.fullname" . }} | grep -i password
+{{- end }}
+
+Reach the UI:
+{{- if .Values.ingress.enabled }}
+{{- $scheme := ternary "https" "http" (gt (len .Values.ingress.tls) 0) }}
+{{- range .Values.ingress.hosts }}
+{{- $host := .host }}
+{{- range .paths }}
+  {{ $scheme }}://{{ $host }}{{ .path }}
+{{- end }}
+{{- end }}
+{{- else }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "sub2api.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  http://127.0.0.1:{{ .Values.service.port }}
+{{- end }}
+
+Verify the release:
+
+  helm test {{ .Release.Name }} --namespace {{ .Release.Namespace }}

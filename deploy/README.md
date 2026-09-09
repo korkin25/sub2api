@@ -9,6 +9,7 @@ This directory contains files for deploying Sub2API on Linux servers and Apple-s
 | **Docker Compose** | Quick setup, all-in-one | Not needed (auto-setup) |
 | **Apple container** | Native local stack on macOS 26 | Not needed (auto-setup) |
 | **Binary Install** | Production servers, systemd | Web-based wizard |
+| **Helm chart** | Kubernetes clusters | Not needed (auto-setup) |
 
 ## Files
 
@@ -28,6 +29,7 @@ This directory contains files for deploying Sub2API on Linux servers and Apple-s
 | `DATAMANAGEMENTD_CN.md` | datamanagementd 部署与联动说明（中文） |
 | `config.example.yaml` | Example configuration file |
 | `EDGE_SECURITY.md` | Reverse proxy, CDN/WAF, trusted proxy, and ingress hardening guide |
+| `helm/sub2api/` | Helm chart for Kubernetes — see [helm/sub2api/README.md](./helm/sub2api/README.md) |
 
 ---
 
@@ -656,3 +658,25 @@ gateway:
 **Cipher Suites (TLS 1.2):** `49195`, `49196`, `49199`, `49200` (ECDHE variants)
 
 **Curves:** `29` (X25519), `23` (P-256), `24` (P-384), `25` (P-521)
+
+---
+
+## Kubernetes (Helm)
+
+`helm/sub2api/` holds a Helm chart for Kubernetes 1.23+. It deploys the gateway
+against an **external PostgreSQL 14+**, with Redis either bundled by the chart
+or external, and takes every credential from a Secret you supply or from
+explicitly set values — never from a default.
+
+```bash
+helm install sub2api ./deploy/helm/sub2api \
+  --namespace sub2api --create-namespace \
+  --set postgresql.host=postgres.databases.svc.cluster.local \
+  --set auth.databasePassword="$PGPASSWORD" \
+  --set auth.redisPassword="$(openssl rand -hex 16)" \
+  --set auth.jwtSecret="$(openssl rand -hex 32)" \
+  --set auth.totpEncryptionKey="$(openssl rand -hex 32)"
+```
+
+Required values, external PostgreSQL/Redis examples and the credential contract
+are documented in [helm/sub2api/README.md](./helm/sub2api/README.md).

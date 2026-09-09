@@ -1,0 +1,48 @@
+{{- /*
+`helm test` hook: fetches the health endpoint through the Service.
+
+It lives directly under templates/ rather than in the conventional
+templates/tests/ directory because the repository's root .gitignore excludes
+every path named `tests`. Helm identifies a test by the hook annotation, not by
+the directory, so this is equivalent.
+*/ -}}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "sub2api.fullname" . }}-test-health
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sub2api.labels" . | nindent 4 }}
+    app.kubernetes.io/component: test
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: health
+      image: {{ include "sub2api.image" . }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      command:
+        - wget
+      args:
+        - -q
+        - -T
+        - "10"
+        - -O
+        - /dev/null
+        - http://{{ include "sub2api.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}{{ .Values.healthPath }}

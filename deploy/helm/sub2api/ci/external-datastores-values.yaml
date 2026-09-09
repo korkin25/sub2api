@@ -1,0 +1,38 @@
+---
+# Reusable case: an external PostgreSQL and an external Redis, neither of them
+# deployed by this chart. Used by `helm template` / chart-testing to prove the
+# chart renders without any in-cluster datastore.
+postgresql:
+  host: pg-primary.databases.example.com
+  port: 5432
+  database: sub2api
+  username: sub2api
+  sslMode: verify-full
+
+redis:
+  enabled: false
+  host: redis-master.cache.example.com
+  port: 6379
+  db: 0
+  username: sub2api
+  enableTls: true
+
+auth:
+  existingSecret: sub2api-credentials
+
+persistence:
+  enabled: true
+  size: 5Gi
+
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: sub2api.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: sub2api-tls
+      hosts:
+        - sub2api.example.com
