@@ -1,0 +1,165 @@
+# Builds the Sub2API container image from the default branch and publishes it
+# to this repository's GitHub Container Registry package.
+#
+# SCOPE: UNRELEASED BUILDS ONLY. Tagged releases (`v*`) are published by
+# `release.yml` through GoReleaser, so this workflow deliberately does not
+# subscribe to tags — the two never build the same reference twice. What it
+# adds is a `main` image (`:edge`, `:main`, `:sha-<short>`) between releases,
+# which the Helm chart in `deploy/helm/sub2api` and any staging environment can
+# track without waiting for the next tag.
+#
+# Authentication uses the built-in GITHUB_TOKEN, so the workflow is
+# self-sufficient: no repository secret has to be created by hand.
+#
+# TRIGGERS ARE DELIBERATELY PUSH-ONLY. `pull_request_target`, `workflow_run`
+# and `issue_comment` would let code from an unreviewed fork run in a job that
+# holds a token with `packages: write`, and MUST NOT be added here.
+name: Publish edge image to GHCR
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      push_image:
+        description: Push the image to GHCR (uncheck for a build-only dry run)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ghcr-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      REGISTRY: ghcr.io
+      PUSH_IMAGE: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+      # Edge builds stay single-architecture so a push to the default branch
+      # does not pay for a QEMU-emulated arm64 Go build. Multi-architecture
+      # images are produced by the release path.
+      PLATFORMS: linux/amd64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Resolve image name and build metadata
+        id: meta_inputs
+        env:
+          OWNER_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # ghcr.io/<owner>/<repo>, lowercased because an image reference may
+          # not contain uppercase characters.
+          image="$(printf '%s' "${REGISTRY}/${OWNER_REPO}" | tr '[:upper:]' '[:lower:]')"
+
+          # Mark the binary as a prerelease of the version currently on the
+          # branch, so an edge image never reports itself as a release.
+          base="$(tr -d ' \r\n' < backend/cmd/server/VERSION)"
+          short="$(git rev-parse --short HEAD)"
+          version="${base}-edge.${short}"
+
+          {
+            echo "image=${image}"
+            echo "version=${version}"
+            echo "revision=$(git rev-parse HEAD)"
+            echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >>"$GITHUB_OUTPUT"
+
+          echo "Image:     ${image}"
+          echo "Version:   ${version}"
+          echo "Push:      ${PUSH_IMAGE}"
+          echo "Platforms: ${PLATFORMS}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.meta_inputs.outputs.image }}
+          labels: |
+            org.opencontainers.image.title=Sub2API
+            org.opencontainers.image.description=AI API gateway platform for subscription quota distribution
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.meta_inputs.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.meta_inputs.outputs.revision }}
+            org.opencontainers.image.created=${{ steps.meta_inputs.outputs.created }}
+          tags: |
+            type=ref,event=branch
+            type=sha,format=short
+            type=raw,value=edge,enable={{is_default_branch}}
+
+      - name: Log in to GHCR
+        if: env.PUSH_IMAGE == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          push: ${{ env.PUSH_IMAGE == 'true' }}
+          load: ${{ env.PUSH_IMAGE != 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # The Dockerfile defaults GOPROXY/GOSUMDB to the mainland-China
+          # mirrors. GitHub-hosted runners sit outside that network, so they
+          # are pointed back at the global defaults here.
+          build-args: |
+            VERSION=${{ steps.meta_inputs.outputs.version }}
+            COMMIT=${{ steps.meta_inputs.outputs.revision }}
+            DATE=${{ steps.meta_inputs.outputs.created }}
+            GOPROXY=https://proxy.golang.org,direct
+            GOSUMDB=sum.golang.org
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Summary
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          {
+            if [ "${PUSH_IMAGE}" = "true" ]; then
+              echo "### Published to GHCR"
+            else
+              echo "### Build-only run — nothing was pushed"
+            fi
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Digest | \`${IMAGE_DIGEST:-n/a}\` |"
+            echo "| Platforms | \`${PLATFORMS}\` |"
+            echo
+            echo "Tags:"
+            echo
+            printf '%s\n' "${IMAGE_TAGS}" | while IFS= read -r tag; do
+              [ -n "${tag}" ] && printf -- '- %s\n' "${tag}"
+            done
+            echo
+            echo "A GHCR package is **private** when it is first created."
+            echo "Make it public once, under Packages -> sub2api -> Package settings"
+            echo "-> Change visibility, or an anonymous \`docker pull\` will fail."
+          } >>"$GITHUB_STEP_SUMMARY"
