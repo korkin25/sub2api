@@ -61,7 +61,7 @@ concurrency:
 jobs:
   verify:
     if: github.repository == 'korkin25/sub2api'
-    runs-on: pure-vps-linux-x64-sub2api
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       GOPATH: ${{ github.workspace }}/.ci-cache/go
