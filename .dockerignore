@@ -83,3 +83,6 @@ deploy/redis_data/
 .claude/
 issues/
 CLAUDE.md
+
+# Integration workflow caches live on the runner PVC, never in image context.
+.ci-cache

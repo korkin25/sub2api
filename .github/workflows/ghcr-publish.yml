@@ -63,6 +63,12 @@ jobs:
     if: github.repository == 'korkin25/sub2api'
     runs-on: pure-vps-linux-x64-sub2api
     timeout-minutes: 45
+    env:
+      GOPATH: ${{ github.workspace }}/.ci-cache/go
+      GOMODCACHE: ${{ github.workspace }}/.ci-cache/go/pkg/mod
+      GOCACHE: ${{ github.workspace }}/.ci-cache/go-build
+      npm_config_cache: ${{ github.workspace }}/.ci-cache/npm
+      XDG_CACHE_HOME: ${{ github.workspace }}/.ci-cache/xdg
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
@@ -81,6 +87,7 @@ jobs:
       - name: Frontend validation
         working-directory: frontend
         run: |
+          pnpm config set store-dir "$GITHUB_WORKSPACE/.ci-cache/pnpm"
           pnpm install --frozen-lockfile
           pnpm exec vue-tsc --noEmit
           pnpm run test:run
