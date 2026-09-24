@@ -33,9 +33,7 @@ name: Publish image to GHCR
 on:
   push:
     branches:
-      - main
-    tags:
-      - 'v*'
+      - integration/reset-policies
   workflow_dispatch:
     inputs:
       push_image:
@@ -61,7 +59,36 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  verify:
+    if: github.repository == 'korkin25/sub2api'
+    runs-on: pure-vps-linux-x64-sub2api
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - name: Backend reset regression tests
+        working-directory: backend
+        run: go test -p 2 ./internal/service ./internal/handler/admin ./internal/repository
+      - name: Frontend validation
+        working-directory: frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec vue-tsc --noEmit
+          pnpm run test:run
+          pnpm run build
+
   publish:
+    if: github.repository == 'korkin25/sub2api'
+    needs: verify
     # Actions Runner Controller scale set on the owner's cluster. It is
     # linux/amd64 only and CPU-tight, so this job builds a single architecture
     # and never emulates one under QEMU.
@@ -92,7 +119,7 @@ jobs:
 
           image="$(printf '%s' "${REGISTRY}/${OWNER_REPO}" | tr '[:upper:]' '[:lower:]')"
 
-          version=""
+          version="0.2.8-kk.reset.${GITHUB_RUN_NUMBER}.g${GITHUB_SHA:0:7}"
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             version="${GITHUB_REF_NAME#v}"
           fi
