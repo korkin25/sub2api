@@ -1,0 +1,26 @@
+export default {
+  attribution: {
+    title: 'Usage by project and task',
+    scope: 'Uses the selected period, user, API key and model. The filters below apply only to this report. Includes all recorded requests, including zero-cost requests.',
+    project: 'Project', task: 'Task', client: 'Client', host: 'Origin host', api_key: 'API key', model: 'Model', user: 'User',
+    groupBy: 'Group by', all: 'All', unknown: 'Unknown', unnamed: 'Unnamed',
+    unknownOnly: 'Only requests without attribution',
+    unknownHint: 'Historical requests and requests without session information appear as Unknown. Parent and subagent requests contribute once each.',
+    totals: 'Selected period totals', requests: 'Requests', input: 'Input tokens', output: 'Output tokens',
+    cacheCreation: 'Cache creation tokens', cacheRead: 'Cache read tokens', tokens: 'Total tokens',
+    referenceCost: 'Reference cost (USD)', actualCost: 'Sub2API deduction (USD)',
+    costHint: 'Reference cost uses model pricing. Sub2API deduction is the amount charged by this service, not a provider invoice.',
+    rpm: 'Average RPM', tpm: 'Average TPM',
+    rateHint: 'RPM and TPM are averages over the entire selected window ({minutes} minutes). Total tokens = input + output + cache creation + cache read.',
+    window: '{start} – {end} (UTC)',
+    distribution: 'Top 10 by Sub2API deduction', trend: 'Daily token usage',
+    export: 'Export report CSV', refresh: 'Refresh report', loading: 'Loading report…',
+    loadFailed: 'Could not load the attribution report. Refresh to try again.',
+    optionsTruncated: 'Some filter choices are omitted. Narrow the period or user to see more. Report totals and CSV still include all matching requests.',
+    optionsFailed: 'Some filter options could not be loaded. Refresh to try again.',
+    empty: 'No requests match these filters.',
+    rename: 'Rename', name: 'Display name', save: 'Save', cancel: 'Cancel',
+    renameHint: 'Renaming changes the display name for this user. Usage stays grouped under the same ID.',
+    renameFailed: 'Could not save the name. Try again.', exportFailed: 'Could not export the report. Try again.',
+  }
+}

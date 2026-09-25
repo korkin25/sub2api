@@ -104,6 +104,10 @@ func RegisterUserRoutes(
 			usage.GET("/errors/:id", h.Usage.GetErrorDetail)
 			usage.GET("/:id", h.Usage.GetByID)
 			usage.GET("/stats", h.Usage.Stats)
+			usage.GET("/attribution", h.Usage.Attribution)
+			usage.GET("/attribution/options", h.Usage.AttributionOptions)
+			usage.GET("/attribution/export", h.Usage.AttributionExport)
+			usage.PATCH("/attribution/names", h.Usage.RenameAttribution)
 			// User dashboard endpoints
 			usage.GET("/dashboard/stats", h.Usage.DashboardStats)
 			usage.GET("/dashboard/trend", h.Usage.DashboardTrend)

@@ -704,6 +704,10 @@ func registerUsageRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 	{
 		usage.GET("", h.Admin.Usage.List)
 		usage.GET("/stats", h.Admin.Usage.Stats)
+		usage.GET("/attribution", h.Admin.Usage.Attribution)
+		usage.GET("/attribution/options", h.Admin.Usage.AttributionOptions)
+		usage.GET("/attribution/export", h.Admin.Usage.AttributionExport)
+		usage.PATCH("/attribution/names", h.Admin.Usage.RenameAttribution)
 		usage.GET("/search-users", h.Admin.Usage.SearchUsers)
 		usage.GET("/search-api-keys", h.Admin.Usage.SearchAPIKeys)
 		usage.GET("/cleanup-tasks", h.Admin.Usage.ListCleanupTasks)

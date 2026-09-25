@@ -1,0 +1,26 @@
+export default {
+  attribution: {
+    title: '按项目和任务查看用量',
+    scope: '使用所选时间段、用户、API 密钥和模型。以下筛选条件仅适用于本报告。包含所有已记录的请求，包括零费用请求。',
+    project: '项目', task: '任务', client: '客户端', host: '起始主机', api_key: 'API 密钥', model: '模型', user: '用户',
+    groupBy: '分组方式', all: '全部', unknown: '未知', unnamed: '未命名',
+    unknownOnly: '仅显示无归属信息的请求',
+    unknownHint: '历史请求和缺少会话信息的请求显示为“未知”。主代理和子代理的每次请求均只计入一次。',
+    totals: '所选时间段合计', requests: '请求数', input: '输入 Token', output: '输出 Token',
+    cacheCreation: '缓存创建 Token', cacheRead: '缓存读取 Token', tokens: 'Token 总数',
+    referenceCost: '参考费用（美元）', actualCost: 'Sub2API 扣费（美元）',
+    costHint: '参考费用基于模型定价。Sub2API 扣费是本服务实际扣除的金额，并非供应商账单。',
+    rpm: '平均 RPM', tpm: '平均 TPM',
+    rateHint: 'RPM 和 TPM 为整个所选时间窗口（{minutes} 分钟）的平均值。Token 总数 = 输入 + 输出 + 缓存创建 + 缓存读取。',
+    window: '{start} – {end}（UTC）',
+    distribution: 'Sub2API 扣费前 10 名', trend: '每日 Token 用量',
+    export: '导出报告 CSV', refresh: '刷新报告', loading: '正在加载报告…',
+    loadFailed: '无法加载归属报告，请刷新后重试。',
+    optionsTruncated: '部分筛选选项未显示。请缩小时间段或用户范围以查看更多选项。报告合计和 CSV 仍包含所有匹配请求。',
+    optionsFailed: '部分筛选选项加载失败，请刷新后重试。',
+    empty: '没有符合筛选条件的请求。',
+    rename: '重命名', name: '显示名称', save: '保存', cancel: '取消',
+    renameHint: '重命名仅更改该用户的显示名称，用量仍按同一 ID 汇总。',
+    renameFailed: '无法保存名称，请重试。', exportFailed: '无法导出报告，请重试。',
+  }
+}

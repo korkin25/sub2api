@@ -159,6 +159,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 
 	setOpsRequestContext(c, "", false)
 
+	service.CaptureUsageSessionFromBody(c, body)
 	bodyRef := service.NewRequestBodyRef(body)
 	parsedReq, err := service.ParseGatewayRequest(bodyRef, domain.PlatformAnthropic)
 	if err != nil {
@@ -2112,6 +2113,7 @@ func (h *GatewayHandler) CountTokens(c *gin.Context) {
 
 	setOpsRequestContext(c, "", false)
 
+	service.CaptureUsageSessionFromBody(c, body)
 	bodyRef := service.NewRequestBodyRef(body)
 	parsedReq, err := service.ParseGatewayRequest(bodyRef, domain.PlatformAnthropic)
 	if err != nil {
