@@ -2,6 +2,7 @@
   <AppLayout>
     <div class="space-y-6">
       <UsageStatsCards :stats="usageStats" :show-account-cost="false" :strike-standard-cost="true" />
+      <UsageAttributionPanel :start-date="startDate" :end-date="endDate" :api-key-id="filters.api_key_id" :model="filters.model" />
 
       <div class="space-y-4">
         <div class="card p-4">
@@ -224,6 +225,7 @@ import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
 import { FeatureFlags, resolveFeatureFlag } from '@/utils/featureFlags'
 import { keysAPI, usageAPI, userGroupsAPI } from '@/api'
+import UsageAttributionPanel from '@/components/usage/UsageAttributionPanel.vue'
 import AppLayout from '@/components/layout/AppLayout.vue'
 import Pagination from '@/components/common/Pagination.vue'
 import Select, { type SelectOption } from '@/components/common/Select.vue'

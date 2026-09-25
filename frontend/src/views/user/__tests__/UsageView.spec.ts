@@ -158,6 +158,7 @@ function mountUsageView() {
         Select: true,
         DateRangePicker: true,
         Icon: true,
+        UsageAttributionPanel: true,
         UsageStatsCards: chartStub,
         UsageTable: chartStub,
         UserErrorRequestsTable: chartStub,

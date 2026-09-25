@@ -70,6 +70,7 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 	}
 
 	// Extract model and stream using gjson (like OpenAI handler)
+	service.CaptureUsageSessionFromBody(c, body)
 	modelResult := gjson.GetBytes(body, "model")
 	if !modelResult.Exists() || modelResult.Type != gjson.String || modelResult.String() == "" {
 		h.responsesErrorResponse(c, http.StatusBadRequest, "invalid_request_error", "model is required")

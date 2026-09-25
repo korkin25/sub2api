@@ -29,6 +29,9 @@ func RegisterGatewayRoutes(
 	compositeResolver *service.CompositeRouteResolver,
 	cfg *config.Config,
 ) {
+	if h.Usage != nil {
+		r.POST("/api/v1/usage-attribution/sessions", gin.HandlerFunc(apiKeyAuth), h.Usage.RegisterAttribution)
+	}
 	bodyLimit := middleware.RequestBodyLimit(cfg.Gateway.MaxBodySize)
 	textBodyLimit := middleware.RequestBodyLimit(cfg.Gateway.TextMaxBodySize)
 	clientRequestID := middleware.ClientRequestID()

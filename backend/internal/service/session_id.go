@@ -1,10 +1,12 @@
 package service
 
 import (
+	"encoding/json"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 // maxPersistedSessionIDLength bounds the persisted client session identifier to the
@@ -43,6 +45,33 @@ func ClaudeCodeSessionIDFromHeader(c *gin.Context) string {
 func ExtractClientSessionID(c *gin.Context) string {
 	if c == nil || c.Request == nil {
 		return ""
+	}
+	if value, ok := c.Get("usage_attribution_session_id"); ok {
+		if id, ok := value.(string); ok {
+			return id
+		}
+	}
+	return extractUsageSessionHeaders(c)
+}
+
+func extractUsageSessionHeaders(c *gin.Context) string {
+	if c == nil || c.Request == nil {
+		return ""
+	}
+	if id := sanitizeSessionID(c.GetHeader("thread-id")); id != "" {
+		return id
+	}
+	var turn struct {
+		ThreadID  string `json:"thread_id"`
+		SessionID string `json:"session_id"`
+	}
+	if raw := c.GetHeader("x-codex-turn-metadata"); len(raw) <= 16384 && json.Unmarshal([]byte(raw), &turn) == nil {
+		if id := sanitizeSessionID(turn.ThreadID); id != "" {
+			return id
+		}
+		if id := sanitizeSessionID(turn.SessionID); id != "" {
+			return id
+		}
 	}
 	for _, header := range clientSessionIDHeaders {
 		if sessionID := sanitizeSessionID(c.GetHeader(header)); sessionID != "" {
@@ -84,4 +113,49 @@ func sanitizeSessionID(raw string) string {
 		}
 	}
 	return trimmed
+}
+
+// CaptureUsageSessionFromBody runs before provider rewrites and before asynchronous
+// recording. Only correlation metadata is read; the body is not retained or changed.
+func CaptureUsageSessionFromBody(c *gin.Context, body []byte) {
+	if c == nil {
+		return
+	}
+	if _, exists := c.Get("usage_attribution_session_id"); exists {
+		return
+	}
+	// Freeze absence too: provider-generated identifiers must never backfill unknown usage.
+	c.Set("usage_attribution_session_id", ExtractUsageSessionFromBody(c, body))
+}
+
+// ExtractUsageSessionFromBody prefers per-request/per-frame native metadata over
+// handshake headers. It deliberately ignores cached Gin state for WebSocket turns.
+func ExtractUsageSessionFromBody(c *gin.Context, body []byte) string {
+	for _, path := range []string{"client_metadata.thread_id", "client_metadata.x-codex-turn-metadata", "client_metadata.session_id"} {
+		raw := gjson.GetBytes(body, path)
+		id := raw.String()
+		if path == "client_metadata.x-codex-turn-metadata" {
+			if raw.IsObject() {
+				id = raw.Get("thread_id").String()
+			} else {
+				id = codexTurnMetadataThreadID(raw.String())
+			}
+		}
+		if id = sanitizeSessionID(id); id != "" {
+			return id
+		}
+	}
+	raw := gjson.GetBytes(body, "metadata.user_id")
+	var id string
+	if raw.Type == gjson.String {
+		if parsed := ParseMetadataUserID(raw.String()); parsed != nil {
+			id = parsed.SessionID
+		}
+	} else if raw.IsObject() {
+		id = raw.Get("session_id").String()
+	}
+	if id = sanitizeSessionID(id); id != "" {
+		return id
+	}
+	return extractUsageSessionHeaders(c)
 }

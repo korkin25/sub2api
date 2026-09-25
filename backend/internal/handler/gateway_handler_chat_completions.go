@@ -70,6 +70,7 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 	}
 
 	// Extract model and stream
+	service.CaptureUsageSessionFromBody(c, body)
 	modelResult := gjson.GetBytes(body, "model")
 	if !modelResult.Exists() || modelResult.Type != gjson.String || modelResult.String() == "" {
 		h.chatCompletionsErrorResponse(c, http.StatusBadRequest, "invalid_request_error", "model is required")
