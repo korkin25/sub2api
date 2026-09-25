@@ -13,7 +13,7 @@ func assessExpiringUsefulReset(usage *OpenAIQuotaUsage, account *Account, config
 	if !isOpenAIAutoResetCreditAccount(account) || !config.Enabled || usage == nil || usage.RateLimit == nil || usage.RateLimitResetCredits == nil {
 		return false
 	}
-	if config.ExpiryHorizonSeconds < 60 || config.ExpiryHorizonSeconds > 604800 || !isValidOpenAIAutoResetThreshold(config.ExpiryMinUtilization) {
+	if config.ExpiryHorizonSeconds < 60 || config.ExpiryHorizonSeconds > 604800 || !config.validExpiryMinUtilization() {
 		return false
 	}
 	fetched := time.Unix(usage.FetchedAt, 0)
@@ -29,6 +29,11 @@ func assessExpiringUsefulReset(usage *OpenAIQuotaUsage, account *Account, config
 	expiry, err := time.Parse(time.RFC3339, candidate.ExpiresAt)
 	if err != nil || !expiry.After(now) || expiry.After(now.Add(time.Duration(config.ExpiryHorizonSeconds)*time.Second)) {
 		return false
+	}
+	// An enforced policy with min_utilization=0 redeems a credit that would
+	// otherwise expire unused, regardless of current window usage.
+	if config.expiryUnconditional() {
+		return true
 	}
 	// Require a measured benefit in an active standard window. Unknown/custom
 	// windows, invalid utilization, and naturally elapsed windows prove nothing.

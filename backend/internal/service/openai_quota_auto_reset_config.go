@@ -36,11 +36,33 @@ type OpenAIAutoResetCreditConfig struct {
 	Enabled              bool
 	Threshold5h          float64
 	Threshold7d          float64
+
+	// Enforced marks a config projected from an enforced global policy
+	// (reset_policy.<provider>). Per-account configs leave the fields below
+	// zero and keep the legacy 100% exhaustion rule.
+	Enforced            bool
+	ExhaustionThreshold float64
+	Exhaustion5h        bool
+	Exhaustion7d        bool
 }
 
 // ResolveOpenAIAutoResetCreditConfig 只接受 OpenAI OAuth 母账号；历史账号未配置时
 // 始终保持关闭，防止升级后产生意外消费。
+//
+// An enforced global OpenAI policy (reset_policy.openai.enforce) replaces the
+// per-account settings of every eligible parent account.
 func ResolveOpenAIAutoResetCreditConfig(account *Account) OpenAIAutoResetCreditConfig {
+	if isOpenAIAutoResetCreditAccount(account) {
+		if policy := openAIResetCreditGlobalPolicy(); policy.Enforce {
+			return policy.autoResetConfig()
+		}
+	}
+	return resolvePerAccountAutoResetCreditConfig(account)
+}
+
+// resolvePerAccountAutoResetCreditConfig reads only the account's own extra
+// settings (legacy behaviour, also reused for Claude's prefixed keys).
+func resolvePerAccountAutoResetCreditConfig(account *Account) OpenAIAutoResetCreditConfig {
 	config := OpenAIAutoResetCreditConfig{
 		Mode:                 OpenAIAutoResetModeThreshold,
 		ExpiryHorizonSeconds: 3600,
