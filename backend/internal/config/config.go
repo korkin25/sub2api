@@ -105,6 +105,7 @@ type Config struct {
 	BatchImage              BatchImageConfig              `mapstructure:"batch_image"`
 	ImageStorage            ImageStorageConfig            `mapstructure:"image_storage"`
 	Plugins                 PluginConfig                  `mapstructure:"plugins"`
+	ResetPolicy             ResetPolicyConfig             `mapstructure:"reset_policy"`
 
 	// Enforce only API-key spending windows in simple mode.
 	SimpleModeKeyRateLimitEnabled bool `mapstructure:"simple_mode_key_rate_limit_enabled" yaml:"simple_mode_key_rate_limit_enabled"`
@@ -2578,6 +2579,7 @@ func setDefaults() {
 	viper.SetDefault("subscription_maintenance.queue_size", 1024)
 
 	setEnvReachableDefaults()
+	setResetPolicyDefaults()
 }
 
 // setEnvReachableDefaults registers zero-valued defaults for keys that are
@@ -2673,6 +2675,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("security.proxy_probe.urls: %w", err)
 	}
 	c.Security.ProxyProbe.URLs = proxyProbeURLs
+	if err := c.ResetPolicy.Validate(); err != nil {
+		return err
+	}
 	if c.Plugins.MaxUploadBytes <= 0 || c.Plugins.MaxUploadBytes > 1024*1024*1024 {
 		return fmt.Errorf("plugins.max_upload_bytes must be between 1 and 1073741824")
 	}

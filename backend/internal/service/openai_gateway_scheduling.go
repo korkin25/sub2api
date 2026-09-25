@@ -536,6 +536,12 @@ func shouldAutoPauseOpenAIAccountByQuota(ctx context.Context, account *Account) 
 			notifyOpenAIAutoResetScoped(ctx, account.ID)
 			return true, openAIQuotaAutoPauseDecision{window: "7d", threshold: config.Threshold7d, utilization: utilization7d, reason: "quota_auto_reset_pending_7d"}
 		}
+		// An enforced global policy can spend below 100%; register the cohort
+		// scope without pausing the account (the worker re-checks natively).
+		if config.Enforced && config.exhaustionTriggerEnabled() &&
+			((has5h && config.windowOverThreshold("5h", utilization5h)) || (has7d && config.windowOverThreshold("7d", utilization7d))) {
+			notifyOpenAIAutoResetSoftThreshold(ctx, account.ID, now)
+		}
 
 		disabled5h := resolveAccountExtraBool(account.Extra, "auto_pause_5h_disabled")
 		disabled7d := resolveAccountExtraBool(account.Extra, "auto_pause_7d_disabled")

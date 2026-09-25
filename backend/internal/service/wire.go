@@ -207,7 +207,9 @@ func ProvideOpenAIQuotaAutoResetService(
 	audit *AuditLogService,
 	settingService *SettingService,
 	leaderLock LeaderLockCache,
+	cfg *config.Config,
 ) *OpenAIQuotaAutoResetService {
+	SetResetCreditGlobalPolicies(cfg)
 	service := NewOpenAIQuotaAutoResetService(
 		accountRepo,
 		quotaService,
@@ -1072,7 +1074,8 @@ func ProvideChannelMonitorV2Aggregator(repo ChannelMonitorV2Repository, db *sql.
 	return aggregator
 }
 
-func ProvideClaudeResetCreditService(accounts AccountRepository, tokens *ClaudeTokenProvider, proxies ProxyRepository, settings *SettingService, idem *IdempotencyCoordinator, locks LeaderLockCache, fetcher ClaudeUsageFetcher) *ClaudeResetCreditService {
+func ProvideClaudeResetCreditService(accounts AccountRepository, tokens *ClaudeTokenProvider, proxies ProxyRepository, settings *SettingService, idem *IdempotencyCoordinator, locks LeaderLockCache, fetcher ClaudeUsageFetcher, cfg *config.Config) *ClaudeResetCreditService {
+	SetResetCreditGlobalPolicies(cfg)
 	s := NewClaudeResetCreditService(accounts, tokens, proxies, settings)
 	s.ConfigureRedemption(accounts, idem, locks)
 	s.startAutomatic(accounts, fetcher)

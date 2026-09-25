@@ -1065,6 +1065,52 @@ plugins:
   start_timeout_seconds: 15
 
 # =============================================================================
+# Global Automatic Reset-Credit Policy (Optional)
+# 全局自动重置卡策略（可选）
+# =============================================================================
+# One policy per provider: openai (Codex OAuth parent accounts) and anthropic
+# (Claude OAuth parent accounts). A policy has effect only while enforce=true;
+# then it replaces the per-account auto reset settings of every non-shadow OAuth
+# parent account of that provider (including accounts where it is disabled).
+# With enforce=false the other keys are ignored (but still validated) and
+# per-account behaviour is unchanged. An enforced policy with both triggers
+# disabled turns automatic resets off for that provider.
+# Every key is also settable from the environment, e.g.
+#   RESET_POLICY_OPENAI_ENFORCE=true
+#   RESET_POLICY_OPENAI_EXPIRY_HORIZON=2h
+#   RESET_POLICY_ANTHROPIC_EXHAUSTION_THRESHOLD=0.95
+#   RESET_POLICY_ANTHROPIC_EXHAUSTION_WINDOWS=7d        (or "5h,7d")
+# Invalid values fail at startup.
+# 每个提供方一套策略；仅在 enforce=true 时生效，并覆盖该提供方所有非影子 OAuth
+# 母账号的单账号设置。enforce=false 时保持原有单账号行为。
+reset_policy:
+  openai:
+    enforce: false
+    expiry:
+      # Redeem a credit that expires within horizon (1m..168h, whole seconds).
+      enabled: false
+      horizon: 1h
+      # Minimum used fraction (0..1) of an active 5h/7d window; 0 = unconditional.
+      min_utilization: 0.25
+    exhaustion:
+      # Redeem when every eligible account of the group/model cohort is at or
+      # above threshold (used fraction, 0.001..1) in at least one listed window.
+      enabled: false
+      threshold: 1.0
+      # Window classes: 5h, 7d (Claude's 7-day Sonnet window counts as 7d).
+      windows: ["5h", "7d"]
+  anthropic:
+    enforce: false
+    expiry:
+      enabled: false
+      horizon: 1h
+      min_utilization: 0.25
+    exhaustion:
+      enabled: false
+      threshold: 1.0
+      windows: ["5h", "7d"]
+
+# =============================================================================
 # Pricing Data Source (Optional)
 # 定价数据源（可选）
 # =============================================================================

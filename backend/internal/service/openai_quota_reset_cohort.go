@@ -32,7 +32,12 @@ func notifyOpenAIAutoResetScoped(ctx context.Context, accountID int64) {
 	service.Notify(accountID)
 }
 
-func (s *OpenAIQuotaAutoResetService) exhaustedCohort(ctx context.Context, target *Account, usage *OpenAIQuotaUsage, now time.Time) bool {
+// exhaustedCohort reports whether every eligible account of the target's
+// scheduling scope is exhausted under cfg's exhaustion rule (legacy: a native
+// 5h/7d window at 100%; enforced policy: at or above the configured threshold
+// in at least one configured window). Any eligible account with capacity left,
+// unknown quota, or an unsupported account type makes it fail closed.
+func (s *OpenAIQuotaAutoResetService) exhaustedCohort(ctx context.Context, target *Account, cfg OpenAIAutoResetCreditConfig, usage *OpenAIQuotaUsage, now time.Time) bool {
 	scopeRaw, ok := s.scopes.Load(target.ID)
 	if !ok {
 		return false
@@ -71,7 +76,7 @@ func (s *OpenAIQuotaAutoResetService) exhaustedCohort(ctx context.Context, targe
 	if !eligible(target) {
 		return false
 	}
-	if !openAIResetNativeExhausted(usage, now) {
+	if !openAIResetExhaustedFor(cfg, usage, now) {
 		return false
 	}
 	accounts, err := s.accountRepo.ListByPlatform(ctx, PlatformOpenAI)
@@ -91,7 +96,7 @@ func (s *OpenAIQuotaAutoResetService) exhaustedCohort(ctx context.Context, targe
 		}
 		// API keys and shadow dimensions have no trustworthy parent-global quota
 		// signal here. Their presence conservatively blocks automatic spending.
-		if cfg := ResolveOpenAIAutoResetCreditConfig(account); cfg.Enabled && cfg.Mode == OpenAIAutoResetModeThreshold {
+		if peerCfg := ResolveOpenAIAutoResetCreditConfig(account); peerCfg.Enabled && peerCfg.Mode == OpenAIAutoResetModeThreshold {
 			return false
 		}
 		if !isOpenAIAutoResetCreditAccount(account) {
@@ -102,12 +107,12 @@ func (s *OpenAIQuotaAutoResetService) exhaustedCohort(ctx context.Context, targe
 			return false
 		}
 		observations = append(observations, fresh)
-		if !openAIResetNativeExhausted(fresh, time.Now()) {
+		if !openAIResetExhaustedFor(cfg, fresh, time.Now()) {
 			return false
 		}
 	}
 	for _, u := range observations {
-		if !openAIResetNativeExhausted(u, time.Now()) {
+		if !openAIResetExhaustedFor(cfg, u, time.Now()) {
 			return false
 		}
 	}
@@ -150,6 +155,43 @@ func openAIResetNativeExhausted(usage *OpenAIQuotaUsage, now time.Time) bool {
 			reset = usage.FetchedAt + window.ResetAfterSeconds
 		}
 		if window.UsedPercent == 100 && reset > now.Unix() {
+			return true
+		}
+	}
+	return false
+}
+
+// openAIResetExhaustedFor applies cfg's exhaustion rule to a fresh native
+// usage snapshot. Per-account configs keep the legacy 100% rule unchanged.
+func openAIResetExhaustedFor(cfg OpenAIAutoResetCreditConfig, usage *OpenAIQuotaUsage, now time.Time) bool {
+	if !cfg.Enforced {
+		return openAIResetNativeExhausted(usage, now)
+	}
+	if usage == nil || usage.RateLimit == nil || usage.FetchedAt <= 0 {
+		return false
+	}
+	fetched := time.Unix(usage.FetchedAt, 0)
+	if fetched.After(now) || now.Sub(fetched) >= openAIAutoResetSnapshotTTL {
+		return false
+	}
+	for _, window := range []*OpenAIRateLimitWindow{usage.RateLimit.PrimaryWindow, usage.RateLimit.SecondaryWindow} {
+		if window == nil {
+			continue
+		}
+		class := ""
+		switch window.LimitWindowSeconds {
+		case 18000:
+			class = "5h"
+		case 604800:
+			class = "7d"
+		default:
+			continue
+		}
+		reset := window.ResetAt
+		if reset <= 0 && window.ResetAfterSeconds > 0 {
+			reset = usage.FetchedAt + window.ResetAfterSeconds
+		}
+		if reset > now.Unix() && cfg.windowOverThreshold(class, window.UsedPercent/100) {
 			return true
 		}
 	}

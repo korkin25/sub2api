@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/google/uuid"
 )
 
@@ -38,6 +39,9 @@ func resolveClaudeAutoResetConfig(a *Account) OpenAIAutoResetCreditConfig {
 	if a == nil || a.Platform != PlatformAnthropic || a.Type != AccountTypeOAuth || a.IsShadow() {
 		return OpenAIAutoResetCreditConfig{}
 	}
+	if policy := anthropicResetCreditGlobalPolicy(); policy.Enforce {
+		return policy.autoResetConfig()
+	}
 	copied := *a
 	copied.Platform = PlatformOpenAI
 	copied.Extra = map[string]any{}
@@ -49,7 +53,7 @@ func resolveClaudeAutoResetConfig(a *Account) OpenAIAutoResetCreditConfig {
 	if _, ok := copied.Extra[OpenAIAutoResetCreditModeExtraKey]; !ok {
 		copied.Extra[OpenAIAutoResetCreditModeExtraKey] = OpenAIAutoResetModeExhausted
 	}
-	cfg := ResolveOpenAIAutoResetCreditConfig(&copied)
+	cfg := resolvePerAccountAutoResetCreditConfig(&copied)
 	if cfg.Mode == OpenAIAutoResetModeThreshold {
 		cfg.Enabled = false
 	}
@@ -188,7 +192,70 @@ func claudeUsageExhausted(u *ClaudeUsageResponse, model string, now time.Time) b
 	}
 	return false
 }
-func (w *claudeQuotaAutoReset) cohort(ctx context.Context, target *Account, scope claudeResetScope, accounts []Account) bool {
+
+// claudeResetDimensionClass maps a native Claude usage dimension to a policy
+// window class. The 7-day Sonnet window is 7d-class.
+func claudeResetDimensionClass(dimension string) string {
+	switch dimension {
+	case "five_hour":
+		return config.ResetPolicyWindow5h
+	case "seven_day", "seven_day_sonnet":
+		return config.ResetPolicyWindow7d
+	default:
+		return ""
+	}
+}
+
+// claudeUsageExhaustedFor applies cfg's exhaustion rule. Per-account configs
+// keep the legacy 100% rule; an enforced policy counts a model-matching window
+// of a configured class at or above the configured threshold.
+func claudeUsageExhaustedFor(cfg OpenAIAutoResetCreditConfig, u *ClaudeUsageResponse, model string, now time.Time) bool {
+	if !cfg.Enforced {
+		return claudeUsageExhausted(u, model, now)
+	}
+	if u == nil {
+		return false
+	}
+	for _, d := range []string{"five_hour", "seven_day", "seven_day_sonnet"} {
+		if !claudeResetDimensionMatchesModel(d, model) {
+			continue
+		}
+		v := claudeUsageDimensions(u)[d]
+		reset, err := time.Parse(time.RFC3339, v.ResetsAt)
+		if err == nil && reset.After(now) && v.Utilization >= 0 && v.Utilization <= 100 && cfg.windowOverThreshold(claudeResetDimensionClass(d), v.Utilization/100) {
+			return true
+		}
+	}
+	return false
+}
+
+// claudeCreditUsefulForExhaustion reports whether the credit clears a window
+// that makes the cohort exhausted: legacy requires a model-matching cleared
+// dimension at 100%; an enforced policy requires one of a configured class at
+// or above the configured threshold.
+func claudeCreditUsefulForExhaustion(cfg OpenAIAutoResetCreditConfig, credit ClaudeResetCredit, model string) bool {
+	for _, dimension := range credit.Clears {
+		if !claudeResetDimensionMatchesModel(dimension, model) {
+			continue
+		}
+		used, ok := credit.PercentUsed[dimension]
+		if !ok {
+			continue
+		}
+		if !cfg.Enforced {
+			if used == 100 {
+				return true
+			}
+			continue
+		}
+		if used >= 0 && used <= 100 && cfg.windowOverThreshold(claudeResetDimensionClass(dimension), used/100) {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *claudeQuotaAutoReset) cohort(ctx context.Context, target *Account, cfg OpenAIAutoResetCreditConfig, scope claudeResetScope, accounts []Account) bool {
 	if !scope.expires.After(time.Now()) || scope.gateway == nil {
 		return false
 	}
@@ -219,7 +286,7 @@ func (w *claudeQuotaAutoReset) cohort(ctx context.Context, target *Account, scop
 			return false
 		}
 		u, err := w.usage(ctx, a)
-		if err != nil || !claudeUsageExhausted(u, scope.model, time.Now()) {
+		if err != nil || !claudeUsageExhaustedFor(cfg, u, scope.model, time.Now()) {
 			return false
 		}
 		observations = append(observations, u)
@@ -228,7 +295,7 @@ func (w *claudeQuotaAutoReset) cohort(ctx context.Context, target *Account, scop
 		return false
 	}
 	for _, u := range observations {
-		if !claudeUsageExhausted(u, scope.model, time.Now()) {
+		if !claudeUsageExhaustedFor(cfg, u, scope.model, time.Now()) {
 			return false
 		}
 	}
@@ -244,7 +311,7 @@ func (w *claudeQuotaAutoReset) evaluate(ctx context.Context, a *Account, cfg Ope
 	if cfg.Mode != OpenAIAutoResetModeExpiring {
 		w.scopes.Range(func(_, v any) bool {
 			scope, ok := v.(claudeResetScope)
-			if ok && w.cohort(ctx, a, scope, accounts) {
+			if ok && w.cohort(ctx, a, cfg, scope, accounts) {
 				exhausted = true
 				picked := scope
 				chosenScope = &picked
@@ -258,23 +325,8 @@ func (w *claudeQuotaAutoReset) evaluate(ctx context.Context, a *Account, cfg Ope
 		if !credit.Redeemable || credit.ResetsLeft <= 0 || credit.SelectionToken == "" {
 			continue
 		}
-		expiring := false
-		if cfg.Mode != OpenAIAutoResetModeExhausted && credit.ExpiresAt != nil && credit.ExpiresAt.After(now) && !credit.ExpiresAt.After(now.Add(time.Duration(cfg.ExpiryHorizonSeconds)*time.Second)) {
-			for _, dimension := range credit.Clears {
-				used, ok := credit.PercentUsed[dimension]
-				if ok && used > 0 && used <= 100 && used/100 >= cfg.ExpiryMinUtilization {
-					expiring = true
-				}
-			}
-		}
-		usefulExhausted := false
-		if exhausted {
-			for _, dimension := range credit.Clears {
-				if credit.PercentUsed[dimension] == 100 && chosenScope != nil && claudeResetDimensionMatchesModel(dimension, chosenScope.model) {
-					usefulExhausted = true
-				}
-			}
-		}
+		expiring := cfg.Mode != OpenAIAutoResetModeExhausted && claudeExpiringUseful(credit, cfg, now)
+		usefulExhausted := exhausted && chosenScope != nil && claudeCreditUsefulForExhaustion(cfg, credit, chosenScope.model)
 		if !usefulExhausted && !expiring {
 			continue
 		}
@@ -297,7 +349,7 @@ func (w *claudeQuotaAutoReset) evaluate(ctx context.Context, a *Account, cfg Ope
 				return false
 			}
 			freshAccounts, err := w.accounts.ListByPlatform(ctx, PlatformAnthropic)
-			if err != nil || !w.cohort(ctx, current, *chosenScope, freshAccounts) {
+			if err != nil || !w.cohort(ctx, current, cfg, *chosenScope, freshAccounts) {
 				return false
 			}
 		}
@@ -313,12 +365,8 @@ func (w *claudeQuotaAutoReset) evaluate(ctx context.Context, a *Account, cfg Ope
 			if expiring {
 				valid = claudeExpiringUseful(freshCredit, cfg, time.Now())
 			}
-			if usefulExhausted && !expiring {
-				for _, dimension := range freshCredit.Clears {
-					if freshCredit.PercentUsed[dimension] == 100 && chosenScope != nil && claudeResetDimensionMatchesModel(dimension, chosenScope.model) {
-						valid = true
-					}
-				}
+			if usefulExhausted && !expiring && chosenScope != nil && claudeCreditUsefulForExhaustion(cfg, freshCredit, chosenScope.model) {
+				valid = true
 			}
 		}
 		if !valid {
@@ -346,7 +394,7 @@ func (w *claudeQuotaAutoReset) evaluate(ctx context.Context, a *Account, cfg Ope
 		if chosenScope != nil {
 			model = chosenScope.model
 		}
-		if usefulExhausted && !expiring && !claudeGrantClearsAllBlocks(before, credit.Clears, model, time.Now()) {
+		if usefulExhausted && !expiring && !claudeGrantClearsAllBlocksFor(cfg, before, credit.Clears, model, time.Now()) {
 			slog.Info("claude_auto_reset_decision", "account_id", a.ID, "trigger", reason, "result", "remaining_blocking_window")
 			return false
 		}
@@ -372,6 +420,11 @@ func (w *claudeQuotaAutoReset) evaluate(ctx context.Context, a *Account, cfg Ope
 func claudeExpiringUseful(credit ClaudeResetCredit, cfg OpenAIAutoResetCreditConfig, now time.Time) bool {
 	if !credit.Redeemable || credit.ExpiresAt == nil || !credit.ExpiresAt.After(now) || credit.ExpiresAt.After(now.Add(time.Duration(cfg.ExpiryHorizonSeconds)*time.Second)) {
 		return false
+	}
+	// An enforced policy with min_utilization=0 redeems an expiring credit
+	// regardless of current window usage.
+	if cfg.expiryUnconditional() {
+		return true
 	}
 	for _, dimension := range credit.Clears {
 		used, ok := credit.PercentUsed[dimension]
@@ -461,4 +514,41 @@ func (w *claudeQuotaAutoReset) recoverVerifiedQuota(ctx context.Context, a *Acco
 	}
 	cleared, err := repo.ClearClaudeRateLimitIfObserved(ctx, a.ID, *a.RateLimitedAt, *a.RateLimitResetAt)
 	return err == nil && cleared
+}
+
+// claudeGrantClearsAllBlocksFor keeps the legacy rule for per-account configs.
+// Under an enforced policy the grant must clear every model-matching window at
+// its limit (otherwise the account stays blocked) and at least one cleared
+// window of a configured class at or above the configured threshold.
+func claudeGrantClearsAllBlocksFor(cfg OpenAIAutoResetCreditConfig, u *ClaudeUsageResponse, clears []string, model string, now time.Time) bool {
+	if !cfg.Enforced {
+		return claudeGrantClearsAllBlocks(u, clears, model, now)
+	}
+	if u == nil {
+		return false
+	}
+	known := map[string]bool{}
+	for _, d := range clears {
+		known[d] = true
+	}
+	useful := false
+	for d, v := range claudeUsageDimensions(u) {
+		if !claudeResetDimensionMatchesModel(d, model) {
+			continue
+		}
+		reset, err := time.Parse(time.RFC3339, v.ResetsAt)
+		if err != nil {
+			return false
+		}
+		if !reset.After(now) {
+			continue
+		}
+		if v.Utilization >= 100 && !known[d] {
+			return false
+		}
+		if known[d] && v.Utilization <= 100 && cfg.windowOverThreshold(claudeResetDimensionClass(d), v.Utilization/100) {
+			useful = true
+		}
+	}
+	return useful
 }

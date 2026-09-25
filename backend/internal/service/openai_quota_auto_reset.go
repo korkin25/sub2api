@@ -363,7 +363,7 @@ func (s *OpenAIQuotaAutoResetService) evaluateAccount(ctx context.Context, accou
 	now = time.Now()
 	assessment = s.assessUsage(usage, account, config, now)
 	if config.Mode != OpenAIAutoResetModeThreshold {
-		assessment.resetReached = config.Mode != OpenAIAutoResetModeExpiring && s.exhaustedCohort(ctx, account, usage, now)
+		assessment.resetReached = config.Mode != OpenAIAutoResetModeExpiring && s.exhaustedCohort(ctx, account, config, usage, now)
 		if (config.Mode == OpenAIAutoResetModeExpiringOrExhausted || config.Mode == OpenAIAutoResetModeExpiring) && assessExpiringUsefulReset(usage, account, config, now) {
 			assessment.resetReached = true
 			assessment.triggerWindow = "expiring"
@@ -423,7 +423,7 @@ func (s *OpenAIQuotaAutoResetService) evaluateAccount(ctx context.Context, accou
 		return err
 	}
 	latestConfig := ResolveOpenAIAutoResetCreditConfig(account)
-	if latestConfig.Mode != config.Mode || !account.IsActive() || !account.Schedulable {
+	if latestConfig.Mode != config.Mode || latestConfig.Enforced != config.Enforced || !account.IsActive() || !account.Schedulable {
 		return nil
 	}
 	if config.Mode != OpenAIAutoResetModeThreshold {
@@ -431,7 +431,7 @@ func (s *OpenAIQuotaAutoResetService) evaluateAccount(ctx context.Context, accou
 		if assessment.triggerWindow == "expiring" && !assessExpiringUsefulReset(usage, account, latestConfig, time.Now()) {
 			return nil
 		}
-		if assessment.triggerWindow != "expiring" && !openAIResetNativeExhausted(usage, time.Now()) {
+		if assessment.triggerWindow != "expiring" && !openAIResetExhaustedFor(latestConfig, usage, time.Now()) {
 			return nil
 		}
 		if err := ctx.Err(); err != nil {
