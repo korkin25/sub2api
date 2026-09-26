@@ -15,6 +15,7 @@ type openAIRateMonitorRepo struct {
 	mu                sync.Mutex
 	account           *Account
 	clearCalls        int
+	statusFilter      string
 	changeBeforeClear func(*Account)
 }
 
@@ -55,9 +56,10 @@ func (r *openAIRateMonitorRepo) ClearOpenAIRateLimitIfUnchanged(_ context.Contex
 	return true, nil
 }
 
-func (r *openAIRateMonitorRepo) ListWithFilters(_ context.Context, _ pagination.PaginationParams, _, _, _, _ string, _ int64, _ string) ([]Account, *pagination.PaginationResult, error) {
+func (r *openAIRateMonitorRepo) ListWithFilters(_ context.Context, _ pagination.PaginationParams, _, _, status, _ string, _ int64, _ string) ([]Account, *pagination.PaginationResult, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.statusFilter = status
 	return []Account{*r.account}, nil, nil
 }
 
@@ -135,10 +137,9 @@ func TestOpenAIRateLimitMonitorRecoversOnlyObservedCooldown(t *testing.T) {
 	require.Equal(t, overload, *repo.account.OverloadUntil)
 	require.Equal(t, temporary, *repo.account.TempUnschedulableUntil)
 	require.NotEmpty(t, repo.account.Extra[openAIRateLimitCheckKey])
-	require.Equal(t, openAIRateLimitGeneration(&Account{RateLimitedAt: &limitedAt, RateLimitResetAt: &resetAt}), repo.account.Extra[openAIRateLimitGenerationKey])
 }
 
-func TestOpenAIRateLimitMonitorRechecksNew429AfterOldQuotaResponse(t *testing.T) {
+func TestOpenAIRateLimitMonitorThrottlesNew429AfterOldQuotaResponse(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	limitedAt, resetAt := now.Add(-time.Hour), now.Add(4*24*time.Hour)
 	repo := &openAIRateMonitorRepo{account: &Account{
@@ -158,8 +159,11 @@ func TestOpenAIRateLimitMonitorRechecksNew429AfterOldQuotaResponse(t *testing.T)
 	svc := NewOpenAIQuotaAutoResetService(repo, quota, nil, nil, nil, nil, nil)
 	require.NoError(t, svc.evaluateAccount(context.Background(), 1))
 	require.Equal(t, rearmedAt, *repo.account.RateLimitedAt)
-	require.True(t, openAIRateLimitCheckStale(repo.account, time.Now()))
+	require.False(t, openAIRateLimitCheckStale(repo.account.Extra, time.Now()))
+	require.NoError(t, svc.evaluateAccount(context.Background(), 1))
+	require.Equal(t, 1, quota.calls, "a new 429 must not trigger another immediate quota query")
 
+	repo.account.Extra[openAIRateLimitCheckKey] = now.Add(-openAIAutoResetSnapshotTTL).Format(time.RFC3339)
 	require.NoError(t, svc.evaluateAccount(context.Background(), 1))
 	require.Equal(t, 2, quota.calls)
 	require.Nil(t, repo.account.RateLimitResetAt)
@@ -195,6 +199,36 @@ func TestOpenAIRateLimitMonitorSelectsBlockedAccountWithoutResetCredits(t *testi
 	}}
 	svc := NewOpenAIQuotaAutoResetService(repo, nil, nil, nil, nil, nil, nil)
 	svc.scanEnabledAccounts(context.Background())
+	require.Empty(t, repo.statusFilter, "the active list filter excludes rate-limited accounts")
 	require.Len(t, svc.queue, 1)
 	require.Equal(t, int64(1), <-svc.queue)
+}
+
+func TestOpenAIRateLimitMonitorSkipsInactiveAccount(t *testing.T) {
+	now := time.Now().UTC()
+	limitedAt, resetAt := now.Add(-time.Hour), now.Add(time.Hour)
+	repo := &openAIRateMonitorRepo{account: &Account{
+		ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusDisabled,
+		RateLimitedAt: &limitedAt, RateLimitResetAt: &resetAt,
+	}}
+	svc := NewOpenAIQuotaAutoResetService(repo, nil, nil, nil, nil, nil, nil)
+	svc.scanEnabledAccounts(context.Background())
+	require.Empty(t, svc.queue)
+}
+
+func TestOpenAIRateLimitMonitorThrottlesBlockedResetPolicy(t *testing.T) {
+	now := time.Now().UTC()
+	limitedAt, resetAt := now.Add(-time.Hour), now.Add(time.Hour)
+	repo := &openAIRateMonitorRepo{account: &Account{
+		ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive,
+		Schedulable: true, RateLimitedAt: &limitedAt, RateLimitResetAt: &resetAt,
+		Extra: map[string]any{
+			OpenAIAutoResetCreditEnabledExtraKey: true,
+			openAIRateLimitCheckKey:              now.Format(time.RFC3339),
+		},
+	}}
+	quota := &openAIRateMonitorQuota{usage: recoveredOpenAIQuota(now)}
+	svc := NewOpenAIQuotaAutoResetService(repo, quota, nil, nil, nil, nil, nil)
+	require.NoError(t, svc.evaluateAccount(context.Background(), 1))
+	require.Zero(t, quota.calls)
 }

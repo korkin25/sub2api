@@ -29,7 +29,6 @@ const (
 	openAIAutoResetAttemptTTL    = 8 * 24 * time.Hour
 	openAIAutoResetLeaderLockKey = "jobs:openai-auto-reset-credit"
 	openAIRateLimitCheckKey      = "openai_rate_limit_checked_at"
-	openAIRateLimitGenerationKey = "openai_rate_limit_checked_generation"
 )
 
 const (
@@ -224,14 +223,14 @@ func (s *OpenAIQuotaAutoResetService) scanEnabledAccounts(ctx context.Context) {
 	for page := 1; ; page++ {
 		accounts, pageInfo, err := s.accountRepo.ListWithFilters(ctx, pagination.PaginationParams{
 			Page: page, PageSize: openAIAutoResetBatchSize,
-		}, PlatformOpenAI, AccountTypeOAuth, StatusActive, "", 0, "")
+		}, PlatformOpenAI, AccountTypeOAuth, "", "", 0, "")
 		if err != nil {
 			slog.Warn("openai_auto_reset_scan_failed", "page", page, "error", err)
 			return
 		}
 		for i := range accounts {
 			account := &accounts[i]
-			if (account.Schedulable && ResolveOpenAIAutoResetCreditConfig(account).Enabled) || account.IsRateLimited() {
+			if account.IsActive() && ((account.Schedulable && ResolveOpenAIAutoResetCreditConfig(account).Enabled) || account.IsRateLimited()) {
 				s.Notify(account.ID)
 			}
 		}
@@ -289,8 +288,11 @@ func (s *OpenAIQuotaAutoResetService) evaluateAccount(ctx context.Context, accou
 	if !account.IsActive() || (!config.Enabled && !account.IsRateLimited()) {
 		return nil
 	}
+	if account.IsRateLimited() && !openAIRateLimitCheckStale(account.Extra, time.Now()) {
+		return nil
+	}
 	if !config.Enabled || !account.Schedulable {
-		if !account.IsRateLimited() || !openAIRateLimitCheckStale(account, time.Now()) {
+		if !account.IsRateLimited() {
 			return nil
 		}
 		usage, err := s.quota.QueryUsage(ctx, accountID)
@@ -309,7 +311,6 @@ func (s *OpenAIQuotaAutoResetService) evaluateAccount(ctx context.Context, accou
 			updates = make(map[string]any, 1)
 		}
 		updates[openAIRateLimitCheckKey] = checkedAt.UTC().Format(time.RFC3339)
-		updates[openAIRateLimitGenerationKey] = openAIRateLimitGeneration(account)
 		return s.accountRepo.UpdateExtra(ctx, accountID, updates)
 	}
 
@@ -337,7 +338,7 @@ func (s *OpenAIQuotaAutoResetService) evaluateAccount(ctx context.Context, accou
 	assessment := s.assessExtra(account, config, now)
 	state := openAIAutoResetStateFromExtra(account.Extra)
 	needsQuery := config.Mode != OpenAIAutoResetModeThreshold || openAIAutoResetSnapshotStale(account.Extra, now) || assessment.resetReached ||
-		(account.IsRateLimited() && openAIRateLimitCheckStale(account, now))
+		account.IsRateLimited()
 	if assessment.pauseReached && !assessment.resetReached {
 		needsQuery = needsQuery || state == nil || state.Status == OpenAIAutoResetStatusChecking || state.Status == OpenAIAutoResetStatusFailed || openAIAutoResetStateStale(state, now)
 	}
@@ -376,8 +377,7 @@ func (s *OpenAIQuotaAutoResetService) evaluateAccount(ctx context.Context, accou
 	}
 	if account.IsRateLimited() {
 		if err := s.accountRepo.UpdateExtra(ctx, accountID, map[string]any{
-			openAIRateLimitCheckKey:      time.Now().UTC().Format(time.RFC3339),
-			openAIRateLimitGenerationKey: openAIRateLimitGeneration(account),
+			openAIRateLimitCheckKey: time.Now().UTC().Format(time.RFC3339),
 		}); err != nil {
 			slog.Warn("openai_rate_limit_check_timestamp_failed", "account_id", accountID, "error", err)
 		}
@@ -597,19 +597,8 @@ func openAIQuotaAllowsRequests(usage *OpenAIQuotaUsage, now time.Time) bool {
 	return knownWindows > 0
 }
 
-func openAIRateLimitGeneration(account *Account) string {
-	if account == nil || account.RateLimitedAt == nil || account.RateLimitResetAt == nil {
-		return ""
-	}
-	return account.RateLimitedAt.UTC().Format(time.RFC3339Nano) + "/" + account.RateLimitResetAt.UTC().Format(time.RFC3339Nano)
-}
-
-func openAIRateLimitCheckStale(account *Account, now time.Time) bool {
-	if account == nil || account.Extra == nil || openAIRateLimitGeneration(account) == "" ||
-		account.Extra[openAIRateLimitGenerationKey] != openAIRateLimitGeneration(account) {
-		return true
-	}
-	if raw, ok := account.Extra[openAIRateLimitCheckKey]; ok {
+func openAIRateLimitCheckStale(extra map[string]any, now time.Time) bool {
+	if raw, ok := extra[openAIRateLimitCheckKey]; ok {
 		if checkedAt, err := parseTime(fmt.Sprint(raw)); err == nil {
 			return now.Sub(checkedAt) >= openAIAutoResetSnapshotTTL
 		}
