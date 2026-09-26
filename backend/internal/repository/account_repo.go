@@ -2363,6 +2363,38 @@ func (r *accountRepository) clearOAuthRateLimitIfObserved(ctx context.Context, i
 	return true, nil
 }
 
+// ClearOpenAIRateLimitIfUnchanged removes only the account-level cooldown after
+// a fresh provider quota check. The row version and rate-limit generation fence
+// a concurrent 429, account edit, or manual clear while the check is in flight.
+func (r *accountRepository) ClearOpenAIRateLimitIfUnchanged(ctx context.Context, id int64, observedUpdatedAt, observedLimitedAt, observedResetAt time.Time) (bool, error) {
+	updated, err := r.client.Account.Update().
+		Where(
+			dbaccount.IDEQ(id),
+			dbaccount.PlatformEQ(service.PlatformOpenAI),
+			dbaccount.TypeEQ(service.AccountTypeOAuth),
+			dbaccount.StatusEQ(service.StatusActive),
+			dbaccount.ParentAccountIDIsNil(),
+			dbaccount.UpdatedAtEQ(observedUpdatedAt),
+			dbaccount.RateLimitedAtEQ(observedLimitedAt),
+			dbaccount.RateLimitResetAtEQ(observedResetAt),
+		).
+		ClearRateLimitedAt().
+		ClearRateLimitResetAt().
+		Save(ctx)
+	if err != nil {
+		return false, err
+	}
+	if updated == 0 {
+		r.syncSchedulerAccountSnapshot(ctx, id)
+		return false, nil
+	}
+	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+		logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue OpenAI rate-limit clear failed: account=%d err=%v", id, err)
+	}
+	r.syncSchedulerAccountSnapshot(ctx, id)
+	return true, nil
+}
+
 // SetRateLimitedIfUnchanged atomically applies a rate-limit reset only while the
 // account still carries exactly the generation the caller observed: its
 // UpdatedAt row version, its RateLimitedAt and its RateLimitResetAt (nil means
