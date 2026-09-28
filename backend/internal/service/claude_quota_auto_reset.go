@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -12,7 +13,11 @@ import (
 	"github.com/google/uuid"
 )
 
-const claudeAutoResetPrefix = "claude_auto_reset_credit_"
+const (
+	claudeAutoResetPrefix        = "claude_auto_reset_credit_"
+	claudeRateLimitCheckKey      = "claude_rate_limit_checked_at"
+	claudeRateLimitCheckInterval = 5 * time.Minute
+)
 
 type claudeResetScope struct {
 	groupID *int64
@@ -153,6 +158,10 @@ func (w *claudeQuotaAutoReset) scan(ctx context.Context) {
 	}
 	for i := range accounts {
 		a := &accounts[i]
+		if a.IsRateLimited() && a.Type == AccountTypeOAuth && !a.IsShadow() {
+			w.monitorRateLimit(ctx, a)
+			continue
+		}
 		cfg := resolveClaudeAutoResetConfig(a)
 		if !cfg.Enabled || !a.IsActive() || !a.Schedulable {
 			continue
@@ -175,6 +184,81 @@ func (w *claudeQuotaAutoReset) usage(ctx context.Context, a *Account) (*ClaudeUs
 		return nil, err
 	}
 	return w.fetcher.FetchUsage(ctx, token, proxy)
+}
+
+func claudeRateLimitCheckDue(extra map[string]any, now time.Time) bool {
+	if raw, ok := extra[claudeRateLimitCheckKey].(string); ok {
+		if checked, err := time.Parse(time.RFC3339Nano, raw); err == nil && now.Sub(checked) < claudeRateLimitCheckInterval && !checked.After(now) {
+			return false
+		}
+	}
+	return true
+}
+
+// A matching reset time ties this cooldown to a reported shared usage window.
+// Both shared windows must be present and healthy; absent windows decode as 0%.
+func claudeUsageAllowsCooldownClear(u *ClaudeUsageResponse, resetAt, now time.Time) bool {
+	if u == nil {
+		return false
+	}
+	matched := false
+	for _, window := range []ClaudeUsageWindow{
+		{Utilization: u.FiveHour.Utilization, ResetsAt: u.FiveHour.ResetsAt},
+		{Utilization: u.SevenDay.Utilization, ResetsAt: u.SevenDay.ResetsAt},
+	} {
+		reset, err := time.Parse(time.RFC3339, window.ResetsAt)
+		if err != nil || !reset.After(now) || reset.After(now.Add(8*24*time.Hour)) ||
+			math.IsNaN(window.Utilization) || math.IsInf(window.Utilization, 0) ||
+			window.Utilization < 0 || window.Utilization >= 100 {
+			return false
+		}
+		matched = matched || reset.Equal(resetAt)
+	}
+	return matched
+}
+
+func (w *claudeQuotaAutoReset) monitorRateLimit(ctx context.Context, observed *Account) {
+	if observed.RateLimitedAt == nil || observed.RateLimitResetAt == nil ||
+		!observed.IsActive() || !claudeRateLimitCheckDue(observed.Extra, time.Now()) {
+		return
+	}
+	usage, err := w.usage(ctx, observed)
+	// Failed and incomplete probes are also throttled, so an unavailable provider
+	// cannot cause one request per scan and account.
+	defer func() {
+		stampCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if stampErr := w.accounts.UpdateExtra(stampCtx, observed.ID, map[string]any{
+			claudeRateLimitCheckKey: time.Now().UTC().Format(time.RFC3339Nano),
+		}); stampErr != nil {
+			slog.Warn("claude_rate_limit_monitor_stamp_failed", "account_id", observed.ID, "error", stampErr)
+		}
+	}()
+	if err != nil || !claudeUsageAllowsCooldownClear(usage, *observed.RateLimitResetAt, time.Now()) {
+		slog.Info("claude_rate_limit_monitor_checked", "account_id", observed.ID, "decision", "blocked_or_unknown")
+		return
+	}
+	current, err := w.accounts.GetByID(ctx, observed.ID)
+	if err != nil || current == nil || !current.IsActive() || current.Type != AccountTypeOAuth ||
+		current.Platform != PlatformAnthropic || current.IsShadow() ||
+		current.RateLimitedAt == nil || current.RateLimitResetAt == nil ||
+		!current.UpdatedAt.Equal(observed.UpdatedAt) ||
+		!current.RateLimitedAt.Equal(*observed.RateLimitedAt) ||
+		!current.RateLimitResetAt.Equal(*observed.RateLimitResetAt) {
+		return
+	}
+	clearer, ok := w.accounts.(interface {
+		ClearClaudeRateLimitIfUnchanged(context.Context, int64, time.Time, time.Time, time.Time) (bool, error)
+	})
+	if !ok {
+		return
+	}
+	cleared, err := clearer.ClearClaudeRateLimitIfUnchanged(ctx, observed.ID, current.UpdatedAt, *observed.RateLimitedAt, *observed.RateLimitResetAt)
+	if err != nil {
+		slog.Warn("claude_rate_limit_monitor_clear_failed", "account_id", observed.ID, "error", err)
+	} else if cleared {
+		slog.Info("claude_rate_limit_recovered", "account_id", observed.ID)
+	}
 }
 func claudeUsageExhausted(u *ClaudeUsageResponse, model string, now time.Time) bool {
 	if u == nil {

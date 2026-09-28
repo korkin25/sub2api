@@ -2337,6 +2337,37 @@ func (r *accountRepository) ClearRateLimitIfObserved(ctx context.Context, id int
 func (r *accountRepository) ClearClaudeRateLimitIfObserved(ctx context.Context, id int64, limitedAt, resetAt time.Time) (bool, error) {
 	return r.clearOAuthRateLimitIfObserved(ctx, id, service.PlatformAnthropic, limitedAt, resetAt)
 }
+
+// ClearClaudeRateLimitIfUnchanged fences a usage probe against account edits
+// and newer 429s while preserving independent scheduling restrictions.
+func (r *accountRepository) ClearClaudeRateLimitIfUnchanged(ctx context.Context, id int64, updatedAt, limitedAt, resetAt time.Time) (bool, error) {
+	updated, err := r.client.Account.Update().
+		Where(
+			dbaccount.IDEQ(id),
+			dbaccount.PlatformEQ(service.PlatformAnthropic),
+			dbaccount.TypeEQ(service.AccountTypeOAuth),
+			dbaccount.StatusEQ(service.StatusActive),
+			dbaccount.ParentAccountIDIsNil(),
+			dbaccount.UpdatedAtEQ(updatedAt),
+			dbaccount.RateLimitedAtEQ(limitedAt),
+			dbaccount.RateLimitResetAtEQ(resetAt),
+		).
+		ClearRateLimitedAt().
+		ClearRateLimitResetAt().
+		Save(ctx)
+	if err != nil {
+		return false, err
+	}
+	if updated == 0 {
+		r.syncSchedulerAccountSnapshot(ctx, id)
+		return false, nil
+	}
+	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+		logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue Claude rate-limit clear failed: account=%d err=%v", id, err)
+	}
+	r.syncSchedulerAccountSnapshot(ctx, id)
+	return true, nil
+}
 func (r *accountRepository) clearOAuthRateLimitIfObserved(ctx context.Context, id int64, platform string, observedLimitedAt, observedResetAt time.Time) (bool, error) {
 	updated, err := r.client.Account.Update().
 		Where(
