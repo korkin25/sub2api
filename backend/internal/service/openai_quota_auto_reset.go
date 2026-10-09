@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -34,6 +35,7 @@ const (
 	// 调度热路径每次过滤候选都会评估暂停，对同一账号的通知按此冷却合并；
 	// 后台每分钟全量扫描兜底，冷却不会让账号漏检。
 	openAIAutoResetSchedulerNotifyCooldown = 30 * time.Second
+	openAIRateLimitCheckKey                = "openai_rate_limit_checked_at"
 )
 
 const (
@@ -228,14 +230,14 @@ func (s *OpenAIQuotaAutoResetService) scanEnabledAccounts(ctx context.Context) {
 	for page := 1; ; page++ {
 		accounts, pageInfo, err := s.accountRepo.ListWithFilters(ctx, pagination.PaginationParams{
 			Page: page, PageSize: openAIAutoResetBatchSize,
-		}, PlatformOpenAI, AccountTypeOAuth, StatusActive, "", 0, "")
+		}, PlatformOpenAI, AccountTypeOAuth, "", "", 0, "")
 		if err != nil {
 			slog.Warn("openai_auto_reset_scan_failed", "page", page, "error", err)
 			return
 		}
 		for i := range accounts {
 			account := &accounts[i]
-			if account.Schedulable && ResolveOpenAIAutoResetCreditConfig(account).Enabled {
+			if account.IsActive() && ((account.Schedulable && ResolveOpenAIAutoResetCreditConfig(account).Enabled) || account.IsRateLimited()) {
 				s.Notify(account.ID)
 			}
 		}
@@ -290,8 +292,39 @@ func (s *OpenAIQuotaAutoResetService) evaluateAccount(ctx context.Context, accou
 		return nil
 	}
 	config := ResolveOpenAIAutoResetCreditConfig(account)
-	if !config.Enabled || !account.IsActive() || !account.Schedulable {
+	if !account.IsActive() || (!config.Enabled && !account.IsRateLimited()) {
 		return nil
+	}
+	if account.IsRateLimited() && !openAIRateLimitCheckStale(account.Extra, time.Now()) {
+		return nil
+	}
+	if !config.Enabled || !account.Schedulable {
+		if !account.IsRateLimited() {
+			return nil
+		}
+		// Throttle failed monitor probes as well as successful ones.
+		if err := s.accountRepo.UpdateExtra(ctx, accountID, map[string]any{
+			openAIRateLimitCheckKey: time.Now().UTC().Format(time.RFC3339),
+		}); err != nil {
+			return err
+		}
+		usage, err := s.quota.QueryUsage(ctx, accountID)
+		if err != nil {
+			return err
+		}
+		if usage == nil {
+			return fmt.Errorf("OpenAI quota query returned no usage")
+		}
+		if err := s.reconcileRateLimit(ctx, account, usage); err != nil {
+			return err
+		}
+		checkedAt := time.Now()
+		updates := buildOpenAIAutoResetUsageUpdates(usage, checkedAt)
+		if updates == nil {
+			updates = make(map[string]any, 1)
+		}
+		updates[openAIRateLimitCheckKey] = checkedAt.UTC().Format(time.RFC3339)
+		return s.accountRepo.UpdateExtra(ctx, accountID, updates)
 	}
 
 	initialMode := config.Mode
@@ -317,9 +350,9 @@ func (s *OpenAIQuotaAutoResetService) evaluateAccount(ctx context.Context, accou
 	now := time.Now()
 	assessment := s.assessExtra(account, config, now)
 	state := openAIAutoResetStateFromExtra(account.Extra)
-	// Preserve the upstream no-credit cooldown for every automatic policy.
+	// Preserve upstream no-credit suppression and query failure backoff for all policies.
 	needsQuery := openAIAutoResetSnapshotStale(account.Extra, now) ||
-		((config.Mode != OpenAIAutoResetModeThreshold || assessment.resetReached) && !openAIAutoResetNoCreditConfirmed(state, now))
+		((config.Mode != OpenAIAutoResetModeThreshold || assessment.resetReached) && !openAIAutoResetNoCreditConfirmed(state, now)) || account.IsRateLimited()
 	if assessment.pauseReached && !assessment.resetReached {
 		needsQuery = needsQuery || state == nil || state.Status == OpenAIAutoResetStatusChecking || state.Status == OpenAIAutoResetStatusFailed || openAIAutoResetStateStale(state, now)
 	}
@@ -355,6 +388,16 @@ func (s *OpenAIQuotaAutoResetService) evaluateAccount(ctx context.Context, accou
 	usage, err := s.quota.QueryUsage(ctx, accountID)
 	if err != nil || usage == nil {
 		return s.failState(ctx, accountID, checking, "RESET_CREDIT_QUERY_FAILED", err)
+	}
+	if err := s.reconcileRateLimit(ctx, account, usage); err != nil {
+		slog.Warn("openai_rate_limit_recovery_failed", "account_id", accountID, "error", err)
+	}
+	if account.IsRateLimited() {
+		if err := s.accountRepo.UpdateExtra(ctx, accountID, map[string]any{
+			openAIRateLimitCheckKey: time.Now().UTC().Format(time.RFC3339),
+		}); err != nil {
+			slog.Warn("openai_rate_limit_check_timestamp_failed", "account_id", accountID, "error", err)
+		}
 	}
 	if err := s.persistFreshUsage(ctx, accountID, usage, now); err != nil {
 		return s.failState(ctx, accountID, checking, "USAGE_SNAPSHOT_WRITE_FAILED", err)
@@ -539,6 +582,77 @@ func (s *OpenAIQuotaAutoResetService) evaluateAccount(ctx context.Context, accou
 		"utilization_7d", assessment.utilization7d,
 		"windows_reset", consumeResult.WindowsReset,
 	)
+	return nil
+}
+
+type openAIRateLimitClearer interface {
+	ClearOpenAIRateLimitIfUnchanged(ctx context.Context, id int64, observedUpdatedAt, observedLimitedAt, observedResetAt time.Time) (bool, error)
+}
+
+func openAIQuotaAllowsRequests(usage *OpenAIQuotaUsage, now time.Time) bool {
+	if usage == nil || usage.RateLimit == nil || usage.FetchedAt <= 0 {
+		return false
+	}
+	fetchedAt := time.Unix(usage.FetchedAt, 0)
+	if fetchedAt.After(now.Add(time.Minute)) || now.Sub(fetchedAt) > openAIAutoResetSnapshotTTL {
+		return false
+	}
+	rateLimit := usage.RateLimit
+	if !rateLimit.Allowed || rateLimit.LimitReached {
+		return false
+	}
+	if rateLimit.PrimaryWindow == nil || rateLimit.SecondaryWindow == nil {
+		return false
+	}
+	seenWindows := make(map[int64]bool, 2)
+	for _, window := range []*OpenAIRateLimitWindow{rateLimit.PrimaryWindow, rateLimit.SecondaryWindow} {
+		seenWindows[window.LimitWindowSeconds] = true
+		if window.LimitWindowSeconds <= 0 || math.IsNaN(window.UsedPercent) || math.IsInf(window.UsedPercent, 0) || window.UsedPercent < 0 || window.UsedPercent >= 100 {
+			return false
+		}
+	}
+	return seenWindows[5*60*60] && seenWindows[7*24*60*60]
+}
+
+func openAIRateLimitCheckStale(extra map[string]any, now time.Time) bool {
+	if raw, ok := extra[openAIRateLimitCheckKey]; ok {
+		if checkedAt, err := parseTime(fmt.Sprint(raw)); err == nil {
+			return checkedAt.After(now.Add(time.Minute)) || now.Sub(checkedAt) >= openAIAutoResetSnapshotTTL
+		}
+	}
+	return true
+}
+
+func (s *OpenAIQuotaAutoResetService) reconcileRateLimit(ctx context.Context, observed *Account, usage *OpenAIQuotaUsage) error {
+	if observed == nil || !observed.IsRateLimited() || observed.RateLimitedAt == nil || observed.IsShadow() {
+		return nil
+	}
+	if !openAIQuotaAllowsRequests(usage, time.Now()) {
+		slog.Info("openai_rate_limit_monitor_checked", "account_id", observed.ID, "decision", "blocked_or_unknown")
+		return nil
+	}
+	current, err := s.accountRepo.GetByID(ctx, observed.ID)
+	if err != nil {
+		return err
+	}
+	if current == nil || !current.IsActive() || !current.IsOpenAIOAuth() || current.IsShadow() ||
+		current.RateLimitedAt == nil || current.RateLimitResetAt == nil ||
+		!current.RateLimitedAt.Equal(*observed.RateLimitedAt) || !current.RateLimitResetAt.Equal(*observed.RateLimitResetAt) ||
+		current.GetChatGPTAccountID() != observed.GetChatGPTAccountID() ||
+		current.GetCredential("organization_id") != observed.GetCredential("organization_id") {
+		return nil
+	}
+	clearer, ok := s.accountRepo.(openAIRateLimitClearer)
+	if !ok {
+		return fmt.Errorf("account repository does not support conditional OpenAI rate-limit recovery")
+	}
+	cleared, err := clearer.ClearOpenAIRateLimitIfUnchanged(ctx, observed.ID, current.UpdatedAt, *observed.RateLimitedAt, *observed.RateLimitResetAt)
+	if err != nil {
+		return err
+	}
+	if cleared {
+		slog.Info("openai_rate_limit_recovered", "account_id", observed.ID, "quota_fetched_at", usage.FetchedAt)
+	}
 	return nil
 }
 
