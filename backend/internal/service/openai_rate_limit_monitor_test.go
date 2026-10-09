@@ -255,3 +255,22 @@ func TestOpenAIRateLimitMonitorFutureCheckDoesNotDisableRecovery(t *testing.T) {
 	now := time.Now()
 	require.True(t, openAIRateLimitCheckStale(map[string]any{openAIRateLimitCheckKey: now.Add(time.Hour).Format(time.RFC3339)}, now))
 }
+
+func TestOpenAIRateLimitMonitorKeepsCooldownAfterCredentialReplacement(t *testing.T) {
+	now := time.Now()
+	limitedAt, resetAt := now.Add(-time.Hour), now.Add(time.Hour)
+	repo := &openAIRateMonitorRepo{account: &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, RateLimitedAt: &limitedAt, RateLimitResetAt: &resetAt,
+		Credentials: map[string]any{"chatgpt_account_id": "synthetic-account", "access_token": "synthetic-old-token"}}}
+	quota := &openAIRateMonitorQuota{usage: recoveredOpenAIQuota(now)}
+	quota.onQuery = func() {
+		repo.mu.Lock()
+		defer repo.mu.Unlock()
+		repo.account.Credentials = map[string]any{"chatgpt_account_id": "synthetic-account", "access_token": "synthetic-replacement-token"}
+		repo.account.UpdatedAt = time.Now()
+	}
+	svc := NewOpenAIQuotaAutoResetService(repo, quota, nil, nil, nil, nil, nil)
+	require.NoError(t, svc.evaluateAccount(context.Background(), 1))
+	require.Equal(t, 1, quota.calls)
+	require.Equal(t, 0, repo.clearCalls)
+	require.NotNil(t, repo.account.RateLimitResetAt)
+}

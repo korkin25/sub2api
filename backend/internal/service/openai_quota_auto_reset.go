@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -635,11 +636,14 @@ func (s *OpenAIQuotaAutoResetService) reconcileRateLimit(ctx context.Context, ob
 	if err != nil {
 		return err
 	}
+	// Monitor/state writes advance UpdatedAt during the query. Fence the complete
+	// credential snapshot separately, then use the current row version for CAS.
 	if current == nil || !current.IsActive() || !current.IsOpenAIOAuth() || current.IsShadow() ||
 		current.RateLimitedAt == nil || current.RateLimitResetAt == nil ||
 		!current.RateLimitedAt.Equal(*observed.RateLimitedAt) || !current.RateLimitResetAt.Equal(*observed.RateLimitResetAt) ||
 		current.GetChatGPTAccountID() != observed.GetChatGPTAccountID() ||
-		current.GetCredential("organization_id") != observed.GetCredential("organization_id") {
+		current.GetCredential("organization_id") != observed.GetCredential("organization_id") ||
+		!reflect.DeepEqual(current.Credentials, observed.Credentials) {
 		return nil
 	}
 	clearer, ok := s.accountRepo.(openAIRateLimitClearer)
