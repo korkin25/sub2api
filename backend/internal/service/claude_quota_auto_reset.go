@@ -412,12 +412,22 @@ func (w *claudeQuotaAutoReset) evaluate(ctx context.Context, a *Account, cfg Ope
 				}
 				return fmt.Errorf("automatic reset benefit changed")
 			}
+			useful := false
+			for _, fresh := range projectClaudeResetCredits(block, time.Now()).Credits {
+				if fresh.policySelection == credit.policySelection && claudeCreditUsefulForExhaustion(cfg, fresh, model) {
+					useful = true
+					break
+				}
+			}
+			if !useful {
+				return fmt.Errorf("automatic reset benefit changed")
+			}
 			freshAccounts, err := w.accounts.ListByPlatform(check, PlatformAnthropic)
-			if err != nil || chosenScope == nil || !w.cohort(check, current, *chosenScope, freshAccounts) {
+			if err != nil || chosenScope == nil || !w.cohort(check, current, cfg, *chosenScope, freshAccounts) {
 				return fmt.Errorf("automatic reset cohort changed")
 			}
 			u, err := w.usage(check, current)
-			if err != nil || !chosenScope.expires.After(time.Now()) || !claudeGrantClearsAllBlocks(u, grant.Clears, model, time.Now()) {
+			if err != nil || !chosenScope.expires.After(time.Now()) || !claudeGrantClearsAllBlocksFor(cfg, u, grant.Clears, model, time.Now()) {
 				return fmt.Errorf("automatic reset quota changed")
 			}
 			return nil

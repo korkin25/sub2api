@@ -161,3 +161,56 @@ func TestClaudeAutoIntegrationRevalidatesNativeGrantBeforeClaim(t *testing.T) {
 		})
 	}
 }
+
+type claudeGlobalGuardUsage struct{ used float64 }
+
+func (f claudeGlobalGuardUsage) FetchUsage(context.Context, string, string) (*ClaudeUsageResponse, error) {
+	return claudeUsageAt(time.Now(), 0, f.used, 0), nil
+}
+func (f claudeGlobalGuardUsage) FetchUsageWithOptions(c context.Context, _ *ClaudeUsageFetchOptions) (*ClaudeUsageResponse, error) {
+	return f.FetchUsage(c, "", "")
+}
+
+func TestClaudeAutoIntegrationResetGlobalPolicyFinalGuard(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		used          float64
+		changeBenefit bool
+		want          int32
+		queries       int
+	}{
+		{"weekly at enforced threshold", 95, false, 1, 4},
+		{"weekly below enforced threshold", 94, false, 0, 1},
+		{"native benefit changed before POST", 95, true, 0, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			policy := ownerResetPolicy()
+			policy.Expiry.Enabled = false
+			installResetPolicies(t, notEnforcedResetPolicy(), policy)
+			worker, posts := newClaudeAutoIntegration(t, false, tc.used)
+			worker.fetcher = claudeGlobalGuardUsage{used: tc.used}
+			worker.scopes.Store("scope", claudeResetScope{model: "claude-opus-4-6", gateway: &GatewayService{}, expires: time.Now().Add(time.Minute)})
+			original := worker.service.do
+			queries := 0
+			worker.service.do = func(r *http.Request, proxy string) (*http.Response, error) {
+				response, err := original(r, proxy)
+				if err != nil || r.Method != http.MethodGet || !strings.Contains(r.URL.Path, "/usage") {
+					return response, err
+				}
+				queries++
+				body, err := io.ReadAll(response.Body)
+				require.NoError(t, err)
+				require.NoError(t, response.Body.Close())
+				text := strings.ReplaceAll(string(body), "five_hour", "seven_day")
+				if tc.changeBenefit && queries == 3 {
+					text = strings.ReplaceAll(text, `"seven_day":95`, `"seven_day":0`)
+				}
+				response.Body = io.NopCloser(strings.NewReader(text))
+				return response, nil
+			}
+			worker.scan(context.Background())
+			require.Equal(t, tc.queries, queries)
+			require.Equal(t, tc.want, posts.Load())
+		})
+	}
+}
