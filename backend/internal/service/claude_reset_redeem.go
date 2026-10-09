@@ -165,6 +165,9 @@ func (s *ClaudeResetCreditService) redeemOnceWithPolicy(ctx context.Context, id 
 	}
 	defer releaseOrg()
 
+	if err := s.checkLegacyResetFence(ctx, orgHash, nil); err != nil {
+		return nil, err
+	}
 	fence, err := s.loadFence(ctx, orgHash)
 	if err != nil {
 		return nil, err
@@ -219,6 +222,9 @@ func (s *ClaudeResetCreditService) redeemOnceWithPolicy(ctx context.Context, id 
 	}
 	if !claudeResetGrantRedeemable(block, *grant, s.now()) {
 		return nil, infraerrors.Conflict("CLAUDE_RESET_NOT_AVAILABLE", "reset eligibility expired")
+	}
+	if err := s.checkLegacyResetFence(ctx, orgHash, grant); err != nil {
+		return nil, err
 	}
 
 	// Persist the unknown marker before sending: a crash after this point blocks
