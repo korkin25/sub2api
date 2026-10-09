@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -28,7 +29,14 @@ const (
 	openAIAutoResetQueueCapacity = 1024
 	openAIAutoResetAttemptTTL    = 8 * 24 * time.Hour
 	openAIAutoResetLeaderLockKey = "jobs:openai-auto-reset-credit"
-	openAIRateLimitCheckKey      = "openai_rate_limit_checked_at"
+	// 查询阶段失败后的最短重试间隔。调度热路径和扫描都会触发评估，不设间隔时上游
+	// 故障期间同一账号会被十几秒重查一次；用卡阶段的失败不受此限，超时后仍立即用
+	// 同一幂等键重试。
+	openAIAutoResetQueryFailureRetryAfter = time.Minute
+	// 调度热路径每次过滤候选都会评估暂停，对同一账号的通知按此冷却合并；
+	// 后台每分钟全量扫描兜底，冷却不会让账号漏检。
+	openAIAutoResetSchedulerNotifyCooldown = 30 * time.Second
+	openAIRateLimitCheckKey                = "openai_rate_limit_checked_at"
 )
 
 const (
@@ -295,6 +303,12 @@ func (s *OpenAIQuotaAutoResetService) evaluateAccount(ctx context.Context, accou
 		if !account.IsRateLimited() {
 			return nil
 		}
+		// Throttle failed monitor probes as well as successful ones.
+		if err := s.accountRepo.UpdateExtra(ctx, accountID, map[string]any{
+			openAIRateLimitCheckKey: time.Now().UTC().Format(time.RFC3339),
+		}); err != nil {
+			return err
+		}
 		usage, err := s.quota.QueryUsage(ctx, accountID)
 		if err != nil {
 			return err
@@ -337,10 +351,14 @@ func (s *OpenAIQuotaAutoResetService) evaluateAccount(ctx context.Context, accou
 	now := time.Now()
 	assessment := s.assessExtra(account, config, now)
 	state := openAIAutoResetStateFromExtra(account.Extra)
-	needsQuery := config.Mode != OpenAIAutoResetModeThreshold || openAIAutoResetSnapshotStale(account.Extra, now) || assessment.resetReached ||
-		account.IsRateLimited()
+	// Preserve upstream no-credit suppression and query failure backoff for all policies.
+	needsQuery := openAIAutoResetSnapshotStale(account.Extra, now) ||
+		((config.Mode != OpenAIAutoResetModeThreshold || assessment.resetReached) && !openAIAutoResetNoCreditConfirmed(state, now)) || account.IsRateLimited()
 	if assessment.pauseReached && !assessment.resetReached {
 		needsQuery = needsQuery || state == nil || state.Status == OpenAIAutoResetStatusChecking || state.Status == OpenAIAutoResetStatusFailed || openAIAutoResetStateStale(state, now)
+	}
+	if needsQuery && openAIAutoResetQueryFailureBackoffActive(state, now) {
+		needsQuery = false
 	}
 	if !needsQuery {
 		if !assessment.pauseReached && state != nil && state.TriggerWindow != "" {
@@ -584,23 +602,23 @@ func openAIQuotaAllowsRequests(usage *OpenAIQuotaUsage, now time.Time) bool {
 	if !rateLimit.Allowed || rateLimit.LimitReached {
 		return false
 	}
-	knownWindows := 0
+	if rateLimit.PrimaryWindow == nil || rateLimit.SecondaryWindow == nil {
+		return false
+	}
+	seenWindows := make(map[int64]bool, 2)
 	for _, window := range []*OpenAIRateLimitWindow{rateLimit.PrimaryWindow, rateLimit.SecondaryWindow} {
-		if window == nil {
-			continue
-		}
-		knownWindows++
+		seenWindows[window.LimitWindowSeconds] = true
 		if window.LimitWindowSeconds <= 0 || math.IsNaN(window.UsedPercent) || math.IsInf(window.UsedPercent, 0) || window.UsedPercent < 0 || window.UsedPercent >= 100 {
 			return false
 		}
 	}
-	return knownWindows > 0
+	return seenWindows[5*60*60] && seenWindows[7*24*60*60]
 }
 
 func openAIRateLimitCheckStale(extra map[string]any, now time.Time) bool {
 	if raw, ok := extra[openAIRateLimitCheckKey]; ok {
 		if checkedAt, err := parseTime(fmt.Sprint(raw)); err == nil {
-			return now.Sub(checkedAt) >= openAIAutoResetSnapshotTTL
+			return checkedAt.After(now.Add(time.Minute)) || now.Sub(checkedAt) >= openAIAutoResetSnapshotTTL
 		}
 	}
 	return true
@@ -618,11 +636,14 @@ func (s *OpenAIQuotaAutoResetService) reconcileRateLimit(ctx context.Context, ob
 	if err != nil {
 		return err
 	}
+	// Monitor/state writes advance UpdatedAt during the query. Fence the complete
+	// credential snapshot separately, then use the current row version for CAS.
 	if current == nil || !current.IsActive() || !current.IsOpenAIOAuth() || current.IsShadow() ||
 		current.RateLimitedAt == nil || current.RateLimitResetAt == nil ||
 		!current.RateLimitedAt.Equal(*observed.RateLimitedAt) || !current.RateLimitResetAt.Equal(*observed.RateLimitResetAt) ||
 		current.GetChatGPTAccountID() != observed.GetChatGPTAccountID() ||
-		current.GetCredential("organization_id") != observed.GetCredential("organization_id") {
+		current.GetCredential("organization_id") != observed.GetCredential("organization_id") ||
+		!reflect.DeepEqual(current.Credentials, observed.Credentials) {
 		return nil
 	}
 	clearer, ok := s.accountRepo.(openAIRateLimitClearer)
@@ -845,6 +866,30 @@ func openAIAutoResetStateFromExtra(extra map[string]any) *OpenAIAutoResetCreditS
 	return &state
 }
 
+// openAIAutoResetNoCreditConfirmed 报告账号在状态有效期内已被确认无卡。
+func openAIAutoResetNoCreditConfirmed(state *OpenAIAutoResetCreditState, now time.Time) bool {
+	return state != nil && state.Status == OpenAIAutoResetStatusNoCredit && !openAIAutoResetStateStale(state, now)
+}
+
+// openAIAutoResetQueryFailureBackoffActive 报告查询阶段刚失败、仍在重试间隔内。
+// 只覆盖查询、快照写入、卡明细缺失三类失败；用卡阶段的失败需要立即按原幂等键重试。
+func openAIAutoResetQueryFailureBackoffActive(state *OpenAIAutoResetCreditState, now time.Time) bool {
+	if state == nil || state.Status != OpenAIAutoResetStatusFailed {
+		return false
+	}
+	switch state.ErrorCode {
+	case "RESET_CREDIT_QUERY_FAILED", "USAGE_SNAPSHOT_WRITE_FAILED", "RESET_CREDIT_DETAILS_UNAVAILABLE":
+	default:
+		return false
+	}
+	failedAt, err := time.Parse(time.RFC3339, state.LastResultAt)
+	if err != nil {
+		return false
+	}
+	elapsed := now.Sub(failedAt)
+	return elapsed >= 0 && elapsed < openAIAutoResetQueryFailureRetryAfter
+}
+
 func openAIAutoResetStateStale(state *OpenAIAutoResetCreditState, now time.Time) bool {
 	if state == nil || state.CheckedAt == "" {
 		return true
@@ -962,4 +1007,30 @@ func notifyOpenAIAutoReset(accountID int64) {
 // NotifyOpenAIAutoResetCredit 供额度查询入口发送轻量信号；不执行同步上游请求。
 func NotifyOpenAIAutoResetCredit(accountID int64) {
 	notifyOpenAIAutoReset(accountID)
+}
+
+// openAIAutoResetSchedulerNotifiedAt 记录调度热路径最近一次为某账号发出通知的时间。
+var openAIAutoResetSchedulerNotifiedAt sync.Map // accountID(int64) -> time.Time
+
+// notifyOpenAIAutoResetFromScheduler 供调度候选过滤使用。候选过滤按请求逐账号执行，
+// 每条通知都会让后台读一次账号，不做冷却时无卡或待用卡的账号会持续占满后台协程。
+func notifyOpenAIAutoResetFromScheduler(accountID int64) {
+	notifyOpenAIAutoResetFromSchedulerAt(accountID, time.Now())
+}
+
+func notifyOpenAIAutoResetFromSchedulerAt(accountID int64, now time.Time) bool {
+	if accountID <= 0 {
+		return false
+	}
+	if last, ok := openAIAutoResetSchedulerNotifiedAt.Load(accountID); ok {
+		if lastAt, ok := last.(time.Time); ok {
+			elapsed := now.Sub(lastAt)
+			if elapsed >= 0 && elapsed < openAIAutoResetSchedulerNotifyCooldown {
+				return false
+			}
+		}
+	}
+	openAIAutoResetSchedulerNotifiedAt.Store(accountID, now)
+	notifyOpenAIAutoReset(accountID)
+	return true
 }

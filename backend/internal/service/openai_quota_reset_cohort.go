@@ -29,7 +29,7 @@ func notifyOpenAIAutoResetScoped(ctx context.Context, accountID int64) {
 		service.scopes.Store(accountID, scope)
 	}
 
-	service.Notify(accountID)
+	notifyOpenAIAutoResetFromScheduler(accountID)
 }
 
 // exhaustedCohort reports whether every eligible account of the target's

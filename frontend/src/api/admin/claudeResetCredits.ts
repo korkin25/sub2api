@@ -1,7 +1,6 @@
 import { apiClient } from '../client'
 
 export interface ClaudeResetCredit {
-  selection_token: string
   label: string
   resets_left: number
   starts_at?: string
@@ -27,15 +26,22 @@ export async function getClaudeResetCredits(id: number): Promise<ClaudeResetCred
   return data
 }
 
-export interface ClaudeResetResult {
-  outcome: 'reset' | 'unknown' | 'already_used' | 'not_limited' | 'cooldown' | 'ineligible' | 'unavailable'
+export type ClaudeResetOutcomeKind = 'reset' | 'already_used' | 'not_limited' | 'cooldown' | 'ineligible' | 'unknown'
+
+export interface ClaudeResetOutcome {
+  outcome: ClaudeResetOutcomeKind
   reason?: string
+  cleared?: string[]
+  cooldown_until?: string
   credits?: ClaudeResetCredits
   replayed: boolean
 }
 
-export async function redeemClaudeResetCredit(id: number, selectionToken: string, idempotencyKey: string): Promise<ClaudeResetResult> {
-  const { data } = await apiClient.post<ClaudeResetResult>(`/admin/accounts/${id}/claude/reset-credits`,
-    { selection_token: selectionToken }, { headers: { 'Idempotency-Key': idempotencyKey }, timeout: 90_000 })
+// Consumes one reset credit (irreversible). The server picks the grant; the key
+// identifies one operator confirmation and must be reused when retrying it.
+export async function redeemClaudeResetCredit(id: number, idempotencyKey: string): Promise<ClaudeResetOutcome> {
+  const { data } = await apiClient.post<ClaudeResetOutcome>(`/admin/accounts/${id}/claude/reset-credits/redeem`, undefined, {
+    headers: { 'Idempotency-Key': idempotencyKey }
+  })
   return data
 }

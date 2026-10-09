@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -322,7 +323,7 @@ func (w *claudeQuotaAutoReset) evaluate(ctx context.Context, a *Account, cfg Ope
 	}
 	now := time.Now()
 	for _, credit := range credits.Credits {
-		if !credit.Redeemable || credit.ResetsLeft <= 0 || credit.SelectionToken == "" {
+		if !credit.Redeemable || credit.ResetsLeft <= 0 || credit.policySelection == "" {
 			continue
 		}
 		expiring := cfg.Mode != OpenAIAutoResetModeExhausted && claudeExpiringUseful(credit, cfg, now)
@@ -359,7 +360,7 @@ func (w *claudeQuotaAutoReset) evaluate(ctx context.Context, a *Account, cfg Ope
 		}
 		valid := false
 		for _, freshCredit := range freshCredits.Credits {
-			if freshCredit.SelectionToken != credit.SelectionToken || !freshCredit.Redeemable {
+			if freshCredit.policySelection != credit.policySelection || !freshCredit.Redeemable {
 				continue
 			}
 			if expiring {
@@ -398,8 +399,47 @@ func (w *claudeQuotaAutoReset) evaluate(ctx context.Context, a *Account, cfg Ope
 			slog.Info("claude_auto_reset_decision", "account_id", a.ID, "trigger", reason, "result", "remaining_blocking_window")
 			return false
 		}
-		key := "claude-auto:" + shortOpenAIAutoResetHash(credit.SelectionToken)
-		outcome, redeemErr := w.service.Redeem(ctx, a.ID, credit.SelectionToken, key)
+		key := "claude-auto:" + shortOpenAIAutoResetHash(credit.policySelection)
+		outcome, redeemErr := w.service.redeemWithPolicy(ctx, a.ID, key, func(check context.Context, block *claudeResetBlock, grant *claudeResetGrant) error {
+			current, err := w.accounts.GetByID(check, a.ID)
+			if err != nil || current == nil || !current.IsActive() || !current.Schedulable || !reflect.DeepEqual(current.Credentials, a.Credentials) || resolveClaudeAutoResetConfig(current) != cfg || claudeResetPolicySelection(*grant) != credit.policySelection {
+				return fmt.Errorf("automatic reset decision changed")
+			}
+			if expiring {
+				for _, fresh := range projectClaudeResetCredits(block, time.Now()).Credits {
+					if fresh.policySelection == credit.policySelection && claudeExpiringUseful(fresh, cfg, time.Now()) {
+						return nil
+					}
+				}
+				return fmt.Errorf("automatic reset benefit changed")
+			}
+			useful := false
+			for _, fresh := range projectClaudeResetCredits(block, time.Now()).Credits {
+				if fresh.policySelection == credit.policySelection && claudeCreditUsefulForExhaustion(cfg, fresh, model) {
+					useful = true
+					break
+				}
+			}
+			if !useful {
+				return fmt.Errorf("automatic reset benefit changed")
+			}
+			freshAccounts, err := w.accounts.ListByPlatform(check, PlatformAnthropic)
+			if err != nil || chosenScope == nil || !w.cohort(check, current, cfg, *chosenScope, freshAccounts) {
+				return fmt.Errorf("automatic reset cohort changed")
+			}
+			u, err := w.usage(check, current)
+			if err != nil || !chosenScope.expires.After(time.Now()) || !claudeGrantClearsAllBlocksFor(cfg, u, grant.Clears, model, time.Now()) {
+				return fmt.Errorf("automatic reset quota changed")
+			}
+
+			// Cohort and quota probes above perform network I/O. Recheck the
+			// identity and policy after them, not only on entry to the guard.
+			latest, err := w.accounts.GetByID(check, a.ID)
+			if err != nil || latest == nil || latest.Platform != PlatformAnthropic || latest.Type != AccountTypeOAuth || !latest.IsActive() || !latest.Schedulable || latest.IsShadow() || !reflect.DeepEqual(latest.Credentials, a.Credentials) || resolveClaudeAutoResetConfig(latest) != cfg {
+				return fmt.Errorf("automatic reset account changed during quota check")
+			}
+			return nil
+		})
 		result := "failed"
 		if outcome != nil {
 			result = outcome.Outcome
@@ -476,7 +516,11 @@ func claudeGrantClearsAllBlocks(u *ClaudeUsageResponse, clears []string, model s
 	return blocked
 }
 func (w *claudeQuotaAutoReset) recoverVerifiedQuota(ctx context.Context, a *Account, before *ClaudeUsageResponse, clears []string) bool {
-	if a.RateLimitedAt == nil || a.RateLimitResetAt == nil {
+	if a == nil || a.RateLimitedAt == nil || a.RateLimitResetAt == nil {
+		return false
+	}
+	current, err := w.accounts.GetByID(ctx, a.ID)
+	if err != nil || !claudeRecoverySameAccount(a, current) {
 		return false
 	}
 	after, err := w.usage(ctx, a)
@@ -506,13 +550,17 @@ func (w *claudeQuotaAutoReset) recoverVerifiedQuota(ctx context.Context, a *Acco
 			return false
 		}
 	}
+	current, err = w.accounts.GetByID(ctx, a.ID)
+	if err != nil || !claudeRecoverySameAccount(a, current) {
+		return false
+	}
 	repo, ok := w.accounts.(interface {
-		ClearClaudeRateLimitIfObserved(context.Context, int64, time.Time, time.Time) (bool, error)
+		ClearClaudeRateLimitIfUnchanged(context.Context, int64, time.Time, time.Time, time.Time) (bool, error)
 	})
 	if !ok {
 		return false
 	}
-	cleared, err := repo.ClearClaudeRateLimitIfObserved(ctx, a.ID, *a.RateLimitedAt, *a.RateLimitResetAt)
+	cleared, err := repo.ClearClaudeRateLimitIfUnchanged(ctx, a.ID, current.UpdatedAt, *a.RateLimitedAt, *a.RateLimitResetAt)
 	return err == nil && cleared
 }
 
@@ -551,4 +599,11 @@ func claudeGrantClearsAllBlocksFor(cfg OpenAIAutoResetCreditConfig, u *ClaudeUsa
 		}
 	}
 	return useful
+}
+
+// The quota observation and cooldown must belong to the same OAuth identity.
+// UpdatedAt is checked atomically by the repository after this comparison.
+func claudeRecoverySameAccount(observed, current *Account) bool {
+	return current != nil && current.Platform == PlatformAnthropic && current.Type == AccountTypeOAuth && current.IsActive() && current.Schedulable && !current.IsShadow() &&
+		current.RateLimitedAt != nil && current.RateLimitResetAt != nil && current.RateLimitedAt.Equal(*observed.RateLimitedAt) && current.RateLimitResetAt.Equal(*observed.RateLimitResetAt) && reflect.DeepEqual(current.Credentials, observed.Credentials)
 }

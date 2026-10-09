@@ -2,8 +2,6 @@ package service
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -22,7 +20,8 @@ const claudeResetUsageURL = "https://api.anthropic.com/api/oauth/usage?cedar_emb
 
 // ClaudeResetCredit is deliberately free of upstream grant and organization IDs.
 type ClaudeResetCredit struct {
-	SelectionToken   string             `json:"selection_token"`
+	policySelection string // server-only identity; never exposed in JSON
+
 	Label            string             `json:"label"`
 	ResetsLeft       int                `json:"resets_left"`
 	StartsAt         *time.Time         `json:"starts_at,omitempty"`
@@ -73,16 +72,17 @@ type claudeResetTokens interface {
 }
 
 type ClaudeResetCreditService struct {
+	accounts claudeResetAccounts
+	tokens   claudeResetTokens
+	proxies  ProxyRepository
+	settings *SettingService
+	do       func(*http.Request, string) (*http.Response, error)
+	now      func() time.Time
+
+	// Redemption only; both are mandatory and never fail open.
 	automatic   *claudeQuotaAutoReset
-	writer      claudeResetWriter
 	idempotency *IdempotencyCoordinator
 	locks       LeaderLockCache
-	accounts    claudeResetAccounts
-	tokens      claudeResetTokens
-	proxies     ProxyRepository
-	settings    *SettingService
-	do          func(*http.Request, string) (*http.Response, error)
-	now         func() time.Time
 }
 
 func NewClaudeResetCreditService(accounts AccountRepository, tokens *ClaudeTokenProvider, proxies ProxyRepository, settings *SettingService) *ClaudeResetCreditService {
@@ -141,54 +141,53 @@ func (s *ClaudeResetCreditService) headers(ctx context.Context, req *http.Reques
 	req.Header.Set("User-Agent", "claude-cli/"+s.settings.GetClaudeCodeClientVersion(ctx)+" (external, cli)")
 }
 
-func (s *ClaudeResetCreditService) query(ctx context.Context, id int64) (*ClaudeResetCredits, *claudeResetBlock, error) {
+func (s *ClaudeResetCreditService) query(ctx context.Context, id int64) (*ClaudeResetCredits, error) {
 	_, token, proxy, err := s.account(ctx, id)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return s.queryWithToken(ctx, token, proxy)
+	block, err := s.fetchBlock(ctx, token, proxy)
+	if err != nil {
+		return nil, err
+	}
+	return projectClaudeResetCredits(block, s.now()), nil
 }
 
-func (s *ClaudeResetCreditService) queryWithToken(ctx context.Context, token, proxy string) (*ClaudeResetCredits, *claudeResetBlock, error) {
+// fetchBlock returns the raw cedar_ember block (nil when absent). It carries grant
+// IDs, so it must never leave the service.
+func (s *ClaudeResetCreditService) fetchBlock(ctx context.Context, token, proxy string) (*claudeResetBlock, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, claudeResetUsageURL, nil)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	s.headers(ctx, req, token)
 	resp, err := s.do(req, proxy)
 	if err != nil {
-		return nil, nil, infraerrors.ServiceUnavailable("CLAUDE_RESET_QUERY_FAILED", "reset status request failed")
+		return nil, infraerrors.ServiceUnavailable("CLAUDE_RESET_QUERY_FAILED", "reset status request failed")
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return nil, nil, infraerrors.New(http.StatusBadGateway, "CLAUDE_RESET_QUERY_FAILED", fmt.Sprintf("reset status upstream HTTP %d", resp.StatusCode))
+		return nil, infraerrors.New(http.StatusBadGateway, "CLAUDE_RESET_QUERY_FAILED", fmt.Sprintf("reset status upstream HTTP %d", resp.StatusCode))
 	}
 	var envelope map[string]json.RawMessage
 	if err = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&envelope); err != nil || envelope == nil {
-		return nil, nil, infraerrors.New(http.StatusBadGateway, "CLAUDE_RESET_STATUS_INVALID", "invalid reset status")
+		return nil, infraerrors.New(http.StatusBadGateway, "CLAUDE_RESET_STATUS_INVALID", "invalid reset status")
 	}
 	if _, ok := envelope["error"]; ok {
-		return nil, nil, infraerrors.New(http.StatusBadGateway, "CLAUDE_RESET_STATUS_INVALID", "invalid reset status")
+		return nil, infraerrors.New(http.StatusBadGateway, "CLAUDE_RESET_STATUS_INVALID", "invalid reset status")
 	}
 	var block *claudeResetBlock
 	raw, present := envelope["cedar_ember"]
 	if present && string(raw) != "null" {
 		if err = json.Unmarshal(raw, &block); err != nil || block == nil || block.Grants == nil {
-			return nil, nil, infraerrors.New(http.StatusBadGateway, "CLAUDE_RESET_STATUS_INVALID", "invalid reset grants")
+			return nil, infraerrors.New(http.StatusBadGateway, "CLAUDE_RESET_STATUS_INVALID", "invalid reset grants")
 		}
 	}
-	result := projectClaudeResetCredits(block, s.now())
-	return result, block, nil
+	return block, nil
 }
 
 func (s *ClaudeResetCreditService) Query(ctx context.Context, id int64) (*ClaudeResetCredits, error) {
-	r, _, e := s.query(ctx, id)
-	return r, e
-}
-
-func claudeGrantSelection(g claudeResetGrant) string {
-	h := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%v:%v", g.ID, g.ResetsLeft, g.StartsAt, g.EndsAt)))
-	return hex.EncodeToString(h[:])
+	return s.query(ctx, id)
 }
 
 func projectClaudeResetCredits(b *claudeResetBlock, now time.Time) *ClaudeResetCredits {
@@ -197,24 +196,54 @@ func projectClaudeResetCredits(b *claudeResetBlock, now time.Time) *ClaudeResetC
 		return r
 	}
 	r.Eligible = b.Eligible
-	r.CooldownUntil = b.CooldownUntil
+	if b.CooldownUntil != nil && now.Before(*b.CooldownUntil) {
+		r.CooldownUntil = b.CooldownUntil
+	}
 	r.WeeklyResetsAt = b.WeeklyResetsAt
 	for _, g := range b.Grants {
-		if !claudeResetGrantIDPattern.MatchString(g.ID) || len(g.Clears) == 0 || g.ResetsLeft <= 0 || g.Paused || (g.StartsAt != nil && now.Before(*g.StartsAt)) || (g.EndsAt != nil && !now.Before(*g.EndsAt)) {
+		if !claudeResetGrantHeld(g, now) {
 			continue
 		}
 		requires := g.UseRequiresLimit == nil || *g.UseRequiresLimit
-		usable := b.Eligible && g.UsableNow && g.ID == b.NextGrantID && (!requires || b.AtLimit) && len(g.Blocking) == 0 && (b.CooldownUntil == nil || !now.Before(*b.CooldownUntil))
+		usable := claudeResetGrantRedeemable(b, g, now)
 		used := map[string]float64{}
 		for k, v := range g.PercentUsed {
 			if v >= 0 && v <= 100 {
 				used[k] = v
 			}
 		}
-		r.Credits = append(r.Credits, ClaudeResetCredit{SelectionToken: claudeGrantSelection(g), Label: g.Label, ResetsLeft: g.ResetsLeft, StartsAt: g.StartsAt, ExpiresAt: g.EndsAt, Clears: g.Clears, PercentUsed: used, Blocking: g.Blocking, UseRequiresLimit: requires, Redeemable: usable})
+		r.Credits = append(r.Credits, ClaudeResetCredit{policySelection: claudeResetPolicySelection(g), Label: g.Label, ResetsLeft: g.ResetsLeft, StartsAt: g.StartsAt, ExpiresAt: g.EndsAt, Clears: g.Clears, PercentUsed: used, Blocking: g.Blocking, UseRequiresLimit: requires, Redeemable: usable})
 		if usable {
 			r.AvailableCount += g.ResetsLeft
 		}
 	}
 	return r
+}
+
+// claudeResetGrantHeld reports whether a grant is a live, well-formed credit.
+func claudeResetGrantHeld(g claudeResetGrant, now time.Time) bool {
+	return claudeResetGrantIDPattern.MatchString(g.ID) && len(g.Clears) > 0 && g.ResetsLeft > 0 && !g.Paused &&
+		(g.StartsAt == nil || !now.Before(*g.StartsAt)) && (g.EndsAt == nil || now.Before(*g.EndsAt))
+}
+
+// claudeResetGrantRedeemable is the single gate shared by the query projection and
+// redemption: only the upstream next grant, usable now, unblocked, outside cooldown,
+// and with its at-limit requirement satisfied.
+func claudeResetGrantRedeemable(b *claudeResetBlock, g claudeResetGrant, now time.Time) bool {
+	if b == nil || !claudeResetGrantHeld(g, now) {
+		return false
+	}
+	requires := g.UseRequiresLimit == nil || *g.UseRequiresLimit
+	return b.Eligible && g.UsableNow && g.ID == b.NextGrantID && (!requires || b.AtLimit) && len(g.Blocking) == 0 &&
+		(b.CooldownUntil == nil || !now.Before(*b.CooldownUntil))
+}
+
+// Bind automatic decisions to the observed grant without a client selection token.
+func claudeResetPolicySelection(g claudeResetGrant) string {
+	raw, _ := json.Marshal(struct {
+		ID         string
+		Count      int
+		Start, End *time.Time
+	}{g.ID, g.ResetsLeft, g.StartsAt, g.EndsAt})
+	return HashIdempotencyKey(string(raw))
 }

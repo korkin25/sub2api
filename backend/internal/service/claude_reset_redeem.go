@@ -1,9 +1,12 @@
 package service
 
+// Manual redemption of Claude native limit resets. The claim protocol (idempotent
+// operation, account + organization leases, durable organization fence) is ported
+// from upstream PR #7591 by korkin25, adapted so the server alone selects the grant.
+
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,72 +18,105 @@ import (
 	"github.com/google/uuid"
 )
 
-const claudeResetPendingScope = "claude_reset_account_fence"
+const (
+	claudeResetOperationScope = "claude_reset_redeem"
+	claudeResetFenceScope     = "claude_reset_org_fence"
+	claudeResetProfileURL     = "https://api.anthropic.com/api/oauth/profile"
+	claudeResetRedeemURLFmt   = "https://api.anthropic.com/api/organizations/%s/reset_rate_limits"
+	claudeResetLeaseTTL       = 90 * time.Second
+	claudeResetRecordTTL      = 365 * 24 * time.Hour
+	// An unconfirmed claim blocks every further redemption of the organization until
+	// the upstream outcome has certainly settled; after that a fresh query is
+	// authoritative again (a consumed credit shows up as a lower count or cooldown).
+	claudeResetUnknownFenceTTL = 24 * time.Hour
+	// An explicit, well-formed "unavailable" answer means nothing was claimed, so it
+	// only fences briefly instead of locking the organization out for a day.
+	claudeResetUnavailableFenceTTL = 15 * time.Minute
+	claudeResetReasonUnavailable   = "upstream_unavailable"
 
+	ClaudeResetOutcomeReset       = "reset"
+	ClaudeResetOutcomeAlreadyUsed = "already_used"
+	ClaudeResetOutcomeNotLimited  = "not_limited"
+	ClaudeResetOutcomeCooldown    = "cooldown"
+	ClaudeResetOutcomeIneligible  = "ineligible"
+	ClaudeResetOutcomeUnknown     = "unknown"
+)
+
+// Only known reason codes and window names reach clients, so an upstream value can
+// never echo a grant ID or other identifier.
+var (
+	claudeResetKnownReasons = map[string]bool{
+		"no_grant": true, "unknown_grant": true, "not_next_grant": true, "grant_id_required": true,
+		"tenure": true, "other_experiment": true, "stamp_indeterminate": true, "reset_unconfirmed": true,
+		"authorization_rejected": true, "claim_unconfirmed": true, claudeResetReasonUnavailable: true,
+		"result_persistence_failed": true,
+	}
+	claudeResetKnownWindows = map[string]bool{"five_hour": true, "seven_day": true, "seven_day_overage_included": true}
+)
+
+// ClaudeResetOutcome is the sanitized redemption result. It never carries grant,
+// organization, or upstream request IDs.
 type ClaudeResetOutcome struct {
-	Outcome  string              `json:"outcome"`
-	Reason   string              `json:"reason,omitempty"`
-	Credits  *ClaudeResetCredits `json:"credits,omitempty"`
-	Replayed bool                `json:"replayed"`
+	Outcome       string              `json:"outcome"`
+	Reason        string              `json:"reason,omitempty"`
+	Cleared       []string            `json:"cleared,omitempty"`
+	CooldownUntil *time.Time          `json:"cooldown_until,omitempty"`
+	Credits       *ClaudeResetCredits `json:"credits,omitempty"`
+	Replayed      bool                `json:"replayed"`
 }
 
-type claudeResetWriter interface {
-	GetByID(context.Context, int64) (*Account, error)
-	UpdateExtra(context.Context, int64, map[string]any) error
+// claudeResetFence is stored in the idempotency table, one row per provider
+// organization, so duplicate local accounts share it and account edits cannot erase it.
+type claudeResetFence struct {
+	Operation string    `json:"operation"`
+	Outcome   string    `json:"outcome"`
+	Reason    string    `json:"reason,omitempty"`
+	At        time.Time `json:"at"`
 }
 
-type claudePreparedClaim struct {
-	Selection      string `json:"selection"`
-	GrantID        string `json:"grant_id"`
-	OrganizationID string `json:"organization_id"`
-	RequestID      string `json:"request_id"`
-}
-
-type claudePendingClaim struct {
-	Selection string `json:"selection"`
-	Outcome   string `json:"outcome"`
-	Reason    string `json:"reason,omitempty"`
-}
-
-// ConfigureRedemption is wired separately from the read-only adapter. Both the
-// PostgreSQL idempotency store and Redis lease are mandatory, never fail-open.
-func (s *ClaudeResetCreditService) ConfigureRedemption(repo AccountRepository, idem *IdempotencyCoordinator, locks LeaderLockCache) {
-	s.writer = repo
+// ConfigureRedemption enables Redeem. Without both stores Redeem refuses to run.
+func (s *ClaudeResetCreditService) ConfigureRedemption(idem *IdempotencyCoordinator, locks LeaderLockCache) {
 	s.idempotency = idem
 	s.locks = locks
 }
 
-func (s *ClaudeResetCreditService) Redeem(ctx context.Context, id int64, selection, key string) (*ClaudeResetOutcome, error) {
+// Redeem consumes the upstream next reset grant of the account, if and only if a
+// fresh query shows it redeemable. key identifies one operator confirmation: the
+// same key replays the stored outcome and never sends a second claim.
+func (s *ClaudeResetCreditService) Redeem(ctx context.Context, id int64, key string) (*ClaudeResetOutcome, error) {
+	return s.redeemWithPolicy(ctx, id, key, nil)
+}
+
+func (s *ClaudeResetCreditService) redeemWithPolicy(ctx context.Context, id int64, key string, guard func(context.Context, *claudeResetBlock, *claudeResetGrant) error) (*ClaudeResetOutcome, error) {
 	if strings.TrimSpace(key) == "" {
 		return nil, ErrIdempotencyKeyRequired
 	}
-	if _, err := NormalizeIdempotencyKey(key); err != nil {
-		return nil, err
-	}
-	if decoded, err := hex.DecodeString(selection); err != nil || len(decoded) != 32 {
-		return nil, infraerrors.BadRequest("CLAUDE_RESET_SELECTION_INVALID", "select an available reset")
-	}
-	if s.idempotency == nil || s.idempotency.repo == nil || s.writer == nil || s.locks == nil {
-		return nil, ErrIdempotencyStoreUnavail
-	}
-	// Validation before entering either idempotency scope prevents replay for a
-	// deleted/replaced/non-Claude account. No OAuth token is stored in either row.
-	if _, _, _, err := s.account(ctx, id); err != nil {
-		return nil, err
-	}
-	result, err := s.idempotency.Execute(ctx, IdempotencyExecuteOptions{
-		Scope: "claude_reset_manual", ActorScope: fmt.Sprintf("account:%d", id), Method: http.MethodPost,
-		Route: "/admin/accounts/claude/reset-credits", IdempotencyKey: HashIdempotencyKey(fmt.Sprintf("%d:%s", id, key)),
-		Payload: map[string]any{"account_id": id, "selection": selection}, TTL: 365 * 24 * time.Hour, RequireKey: true, ExecutionTimeout: 60 * time.Second,
-	}, func(exec context.Context) (any, error) { return s.redeemOnce(exec, id, selection, key) })
+	normalized, err := NormalizeIdempotencyKey(key)
 	if err != nil {
 		return nil, err
 	}
-	var outcome ClaudeResetOutcome
+	if s.idempotency == nil || s.idempotency.repo == nil || s.locks == nil {
+		return nil, ErrIdempotencyStoreUnavail
+	}
+	// Validate before entering the idempotency scope so a deleted or converted
+	// account never replays. No token is stored anywhere.
+	if _, _, _, err = s.account(ctx, id); err != nil {
+		return nil, err
+	}
+	operation := HashIdempotencyKey(fmt.Sprintf("claude-reset:%d:%s", id, normalized))
+	result, err := s.idempotency.Execute(ctx, IdempotencyExecuteOptions{
+		Scope: claudeResetOperationScope, ActorScope: fmt.Sprintf("account:%d", id), Method: http.MethodPost,
+		Route: "/admin/accounts/:id/claude/reset-credits/redeem", IdempotencyKey: operation,
+		Payload: map[string]any{"account_id": id}, TTL: claudeResetRecordTTL, RequireKey: true, ExecutionTimeout: 60 * time.Second,
+	}, func(exec context.Context) (any, error) { return s.redeemOnceWithPolicy(exec, id, operation, guard) })
+	if err != nil {
+		return nil, err
+	}
 	raw, err := json.Marshal(result.Data)
 	if err != nil {
 		return nil, err
 	}
+	var outcome ClaudeResetOutcome
 	if err = json.Unmarshal(raw, &outcome); err != nil {
 		return nil, err
 	}
@@ -88,28 +124,32 @@ func (s *ClaudeResetCreditService) Redeem(ctx context.Context, id int64, selecti
 	return &outcome, nil
 }
 
-func (s *ClaudeResetCreditService) redeemOnce(ctx context.Context, id int64, selection string, operationKey string) (*ClaudeResetOutcome, error) {
-	lockKey := fmt.Sprintf("claude:reset-credit:account:%d", id)
-	owner := uuid.NewString()
-	acquired, err := s.locks.TryAcquireLeaderLock(ctx, lockKey, owner, 90*time.Second)
+func (s *ClaudeResetCreditService) lease(ctx context.Context, key, owner string) (func(), error) {
+	acquired, err := s.locks.TryAcquireLeaderLock(ctx, key, owner, claudeResetLeaseTTL)
 	if err != nil {
 		return nil, infraerrors.ServiceUnavailable("CLAUDE_RESET_LOCK_UNAVAILABLE", "reset coordination unavailable")
 	}
 	if !acquired {
 		return nil, infraerrors.Conflict("CLAUDE_RESET_BUSY", "another reset is in progress")
 	}
-	defer func() {
+	return func() {
 		release, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = s.locks.ReleaseLeaderLock(release, lockKey, owner)
-	}()
-	account, err := s.writer.GetByID(ctx, id)
+		_ = s.locks.ReleaseLeaderLock(release, key, owner)
+	}, nil
+}
+
+func (s *ClaudeResetCreditService) redeemOnce(ctx context.Context, id int64, operation string) (*ClaudeResetOutcome, error) {
+	return s.redeemOnceWithPolicy(ctx, id, operation, nil)
+}
+
+func (s *ClaudeResetCreditService) redeemOnceWithPolicy(ctx context.Context, id int64, operation string, guard func(context.Context, *claudeResetBlock, *claudeResetGrant) error) (*ClaudeResetOutcome, error) {
+	owner := uuid.NewString()
+	release, err := s.lease(ctx, fmt.Sprintf("claude:reset-credit:account:%d", id), owner)
 	if err != nil {
 		return nil, err
 	}
-	if account == nil {
-		return nil, ErrAccountNotFound
-	}
+	defer release()
 	_, token, proxy, err := s.account(ctx, id)
 	if err != nil {
 		return nil, err
@@ -119,125 +159,132 @@ func (s *ClaudeResetCreditService) redeemOnce(ctx context.Context, id int64, sel
 		return nil, err
 	}
 	orgHash := HashIdempotencyKey("claude-org:" + org)
-	orgLockKey := "claude:reset-credit:organization:" + orgHash
-	acquired, err = s.locks.TryAcquireLeaderLock(ctx, orgLockKey, owner, 90*time.Second)
+	releaseOrg, err := s.lease(ctx, "claude:reset-credit:organization:"+orgHash, owner)
 	if err != nil {
-		return nil, infraerrors.ServiceUnavailable("CLAUDE_RESET_LOCK_UNAVAILABLE", "reset coordination unavailable")
+		return nil, err
 	}
-	if !acquired {
-		return nil, infraerrors.Conflict("CLAUDE_RESET_BUSY", "another reset is in progress")
+	defer releaseOrg()
+
+	if err := s.checkLegacyResetFence(ctx, orgHash, nil); err != nil {
+		return nil, err
 	}
-	defer func() {
-		release, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = s.locks.ReleaseLeaderLock(release, orgLockKey, owner)
-	}()
-	// The durable provider-organization fence lives in the operation table, not editable
-	// account.Extra. Ordinary edits/imports cannot erase an ambiguous claim.
-	fenceKey := orgHash
-	fence, err := s.idempotency.repo.GetByScopeAndKeyHash(ctx, claudeResetPendingScope, fenceKey)
+	fence, err := s.loadFence(ctx, orgHash)
 	if err != nil {
-		return nil, ErrIdempotencyStoreUnavail
+		return nil, err
 	}
-	if fence == nil {
-		row := &IdempotencyRecord{Scope: claudeResetPendingScope, IdempotencyKeyHash: fenceKey, RequestFingerprint: orgHash, Status: IdempotencyStatusProcessing, ExpiresAt: s.now().AddDate(100, 0, 0)}
-		_, err = s.idempotency.repo.CreateProcessing(ctx, row)
-		if err != nil {
-			return nil, ErrIdempotencyStoreUnavail
-		}
-		fence, err = s.idempotency.repo.GetByScopeAndKeyHash(ctx, claudeResetPendingScope, fenceKey)
-		if err != nil || fence == nil {
-			return nil, ErrIdempotencyStoreUnavail
-		}
-	}
-	var pending claudePendingClaim
+	var prior claudeResetFence
 	if fence.ResponseBody != nil {
-		if json.Unmarshal([]byte(*fence.ResponseBody), &pending) != nil || pending.Selection == "" {
+		if json.Unmarshal([]byte(*fence.ResponseBody), &prior) != nil || prior.Operation == "" {
 			return nil, infraerrors.Conflict("CLAUDE_RESET_UNRESOLVED", "previous reset requires reconciliation")
 		}
-		if pending.Outcome == "unknown" || pending.Outcome == "" {
-			if pending.Selection == selection {
-				return &ClaudeResetOutcome{Outcome: "unknown", Reason: pending.Reason, Replayed: true}, nil
-			}
-			return nil, infraerrors.Conflict("CLAUDE_RESET_UNRESOLVED", "previous reset outcome is unknown; another credit cannot be used")
+		if prior.Operation == operation {
+			// A crashed or interrupted attempt of this same confirmation: never resend.
+			return &ClaudeResetOutcome{Outcome: prior.Outcome, Reason: prior.Reason, Replayed: true}, nil
 		}
-		if pending.Selection == selection && (pending.Outcome == "reset" || pending.Outcome == "already_used") {
-			return &ClaudeResetOutcome{Outcome: pending.Outcome, Reason: pending.Reason, Replayed: true}, nil
+		if prior.Outcome == ClaudeResetOutcomeUnknown && prior.Reason == claudeResetReasonUnavailable {
+			if s.now().Before(prior.At.Add(claudeResetUnavailableFenceTTL)) {
+				return nil, infraerrors.Conflict("CLAUDE_RESET_UPSTREAM_UNAVAILABLE", "reset service was unavailable; retry after a while")
+			}
+		} else if prior.Outcome == ClaudeResetOutcomeUnknown && s.now().Before(prior.At.Add(claudeResetUnknownFenceTTL)) {
+			return nil, infraerrors.Conflict("CLAUDE_RESET_UNRESOLVED", "previous reset outcome is unconfirmed; redemption is blocked for now")
 		}
 	}
-	status, block, err := s.queryWithToken(ctx, token, proxy)
+
+	// Fresh eligibility check right before the irreversible call; the server alone
+	// picks the grant, and only the upstream next grant can qualify.
+	block, err := s.fetchBlock(ctx, token, proxy)
 	if err != nil {
 		return nil, err
 	}
 	var grant *claudeResetGrant
-	for _, credit := range status.Credits {
-		if credit.SelectionToken == selection && credit.Redeemable {
-			for i := range block.Grants {
-				if claudeGrantSelection(block.Grants[i]) == selection {
-					grant = &block.Grants[i]
-					break
-				}
+	if block != nil {
+		for i := range block.Grants {
+			if block.Grants[i].ID == block.NextGrantID && claudeResetGrantRedeemable(block, block.Grants[i], s.now()) {
+				grant = &block.Grants[i]
+				break
 			}
 		}
 	}
 	if grant == nil {
-		return nil, infraerrors.Conflict("CLAUDE_RESET_NOT_AVAILABLE", "selected reset is no longer available")
+		return nil, infraerrors.Conflict("CLAUDE_RESET_NOT_AVAILABLE", "no reset is redeemable right now")
 	}
-	planResult, err := s.idempotency.Execute(ctx, IdempotencyExecuteOptions{
-		Scope: "claude_reset_prepared", ActorScope: fmt.Sprintf("account:%d", id), Method: http.MethodPost, Route: "/system/claude/reset-plan",
-		IdempotencyKey: HashIdempotencyKey(fmt.Sprintf("%d:%s:%s", id, selection, operationKey)), Payload: map[string]any{"account_id": id, "selection": selection}, TTL: 365 * 24 * time.Hour, RequireKey: true,
-	}, func(context.Context) (any, error) {
-		return claudePreparedClaim{Selection: selection, GrantID: grant.ID, OrganizationID: org, RequestID: uuid.NewString()}, nil
-	})
-	if err != nil {
+
+	if guard != nil {
+		if err := guard(ctx, block, grant); err != nil {
+			return nil, err
+		}
+	}
+
+	// Policy checks can make native calls; do not spend after their deadline
+	// or after the selected grant expires while those calls are in flight.
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	var plan claudePreparedClaim
-	data, err := json.Marshal(planResult.Data)
-	if err != nil {
+	if !claudeResetGrantRedeemable(block, *grant, s.now()) {
+		return nil, infraerrors.Conflict("CLAUDE_RESET_NOT_AVAILABLE", "reset eligibility expired")
+	}
+	if err := s.checkLegacyResetFence(ctx, orgHash, grant); err != nil {
 		return nil, err
 	}
-	if err = json.Unmarshal(data, &plan); err != nil {
-		return nil, err
-	}
-	if plan.OrganizationID != org || plan.GrantID != grant.ID || plan.Selection != selection {
-		return nil, infraerrors.Conflict("CLAUDE_RESET_IDENTITY_CHANGED", "prepared reset identity changed")
-	}
-	// Recheck the native temporal gates immediately before the irreversible call.
-	if grant.EndsAt != nil && !s.now().Before(*grant.EndsAt) {
-		return nil, infraerrors.Conflict("CLAUDE_RESET_NOT_AVAILABLE", "selected reset expired")
-	}
-	if block.CooldownUntil != nil && s.now().Before(*block.CooldownUntil) {
-		return nil, infraerrors.Conflict("CLAUDE_RESET_NOT_AVAILABLE", "reset is cooling down")
-	}
-	// Persist before the irreversible request. A crash anywhere after this write
-	// leaves an unknown marker that forbids both another send and another credit.
-	marker := claudePendingClaim{Selection: selection, Outcome: "unknown", Reason: "claim_unconfirmed"}
+
+	// Persist the unknown marker before sending: a crash after this point blocks
+	// both a resend and another credit until the fence settles.
+	marker := claudeResetFence{Operation: operation, Outcome: ClaudeResetOutcomeUnknown, Reason: "claim_unconfirmed", At: s.now().UTC()}
 	if err = s.persistFence(ctx, fence.ID, marker); err != nil {
 		return nil, err
 	}
-	outcome := s.claim(ctx, token, proxy, plan)
-	marker.Outcome = outcome.Outcome
-	marker.Reason = outcome.Reason
+	outcome := s.claim(ctx, token, proxy, org, grant.ID, operation)
+	marker.Outcome, marker.Reason = outcome.Outcome, outcome.Reason
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	persistErr := s.persistFence(persistCtx, fence.ID, marker)
 	cancel()
 	if persistErr != nil {
-		return &ClaudeResetOutcome{Outcome: "unknown", Reason: "result_persistence_failed"}, nil
+		return &ClaudeResetOutcome{Outcome: ClaudeResetOutcomeUnknown, Reason: "result_persistence_failed"}, nil
 	}
-	if outcome.Outcome == "reset" {
-		fresh, e := s.Query(ctx, id)
-		if e == nil {
-			outcome.Credits = fresh
-		} else {
-			outcome.Reason = "post_reset_query_failed"
+	if outcome.Outcome != ClaudeResetOutcomeUnknown {
+		if fresh, e := s.fetchBlock(ctx, token, proxy); e == nil {
+			outcome.Credits = projectClaudeResetCredits(fresh, s.now())
 		}
 	}
 	return outcome, nil
 }
 
+func (s *ClaudeResetCreditService) loadFence(ctx context.Context, orgHash string) (*IdempotencyRecord, error) {
+	repo := s.idempotency.repo
+	fence, err := repo.GetByScopeAndKeyHash(ctx, claudeResetFenceScope, orgHash)
+	if err != nil {
+		return nil, ErrIdempotencyStoreUnavail
+	}
+	if fence != nil {
+		return fence, nil
+	}
+	row := &IdempotencyRecord{Scope: claudeResetFenceScope, IdempotencyKeyHash: orgHash, RequestFingerprint: orgHash, Status: IdempotencyStatusProcessing, ExpiresAt: s.now().Add(claudeResetRecordTTL)}
+	if _, err = repo.CreateProcessing(ctx, row); err != nil {
+		return nil, ErrIdempotencyStoreUnavail
+	}
+	fence, err = repo.GetByScopeAndKeyHash(ctx, claudeResetFenceScope, orgHash)
+	if err != nil || fence == nil {
+		return nil, ErrIdempotencyStoreUnavail
+	}
+	return fence, nil
+}
+
+func (s *ClaudeResetCreditService) persistFence(ctx context.Context, id int64, marker claudeResetFence) error {
+	body, err := json.Marshal(marker)
+	if err != nil {
+		return err
+	}
+	if err = s.idempotency.repo.MarkSucceeded(ctx, id, http.StatusOK, string(body), s.now().Add(claudeResetRecordTTL)); err != nil {
+		return ErrIdempotencyStoreUnavail
+	}
+	return nil
+}
+
 func (s *ClaudeResetCreditService) organization(ctx context.Context, token, proxy string) (string, error) {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.anthropic.com/api/oauth/profile", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, claudeResetProfileURL, nil)
+	if err != nil {
+		return "", err
+	}
 	s.headers(ctx, req, token)
 	resp, err := s.do(req, proxy)
 	if err != nil {
@@ -249,54 +296,69 @@ func (s *ClaudeResetCreditService) organization(ctx context.Context, token, prox
 			UUID string `json:"uuid"`
 		} `json:"organization"`
 	}
-	if resp.StatusCode != 200 || json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body) != nil {
-		return "", infraerrors.New(502, "CLAUDE_RESET_PROFILE_FAILED", "OAuth profile unavailable")
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body) != nil {
+		return "", infraerrors.New(http.StatusBadGateway, "CLAUDE_RESET_PROFILE_FAILED", "OAuth profile unavailable")
 	}
 	parsed, err := uuid.Parse(body.Organization.UUID)
 	if err != nil || parsed == uuid.Nil {
-		return "", infraerrors.New(502, "CLAUDE_RESET_ORGANIZATION_INVALID", "OAuth organization unavailable")
+		return "", infraerrors.New(http.StatusBadGateway, "CLAUDE_RESET_ORGANIZATION_INVALID", "OAuth organization unavailable")
 	}
 	return parsed.String(), nil
 }
 
-func (s *ClaudeResetCreditService) claim(ctx context.Context, token, proxy string, p claudePreparedClaim) *ClaudeResetOutcome {
-	unknown := &ClaudeResetOutcome{Outcome: "unknown", Reason: "claim_unconfirmed"}
-	body, _ := json.Marshal(map[string]string{"program": "cedar_ember", "grant_id": p.GrantID, "request_id": p.RequestID})
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.anthropic.com/api/organizations/"+p.OrganizationID+"/reset_rate_limits", bytes.NewReader(body))
+// claim sends the single irreversible request. Anything but a well-formed, known
+// result is reported as unknown so the fence blocks a blind retry.
+func (s *ClaudeResetCreditService) claim(ctx context.Context, token, proxy, org, grantID, operation string) *ClaudeResetOutcome {
+	unknown := &ClaudeResetOutcome{Outcome: ClaudeResetOutcomeUnknown, Reason: "claim_unconfirmed"}
+	// Deterministic per confirmation (64 hex chars, matches ^[A-Za-z0-9_-]{1,64}$).
+	body, err := json.Marshal(map[string]string{"program": "cedar_ember", "grant_id": grantID, "request_id": operation})
+	if err != nil {
+		return unknown
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf(claudeResetRedeemURLFmt, org), bytes.NewReader(body))
+	if err != nil {
+		return unknown
+	}
 	s.headers(ctx, req, token)
 	resp, err := s.do(req, proxy)
 	if err != nil {
 		return unknown
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return &ClaudeResetOutcome{Outcome: "ineligible", Reason: "authorization_rejected"}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return &ClaudeResetOutcome{Outcome: ClaudeResetOutcomeIneligible, Reason: "authorization_rejected"}
 	}
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		return unknown
 	}
 	var result struct {
-		Result string `json:"result"`
-		Reason string `json:"reason"`
+		Result        string     `json:"result"`
+		Reason        string     `json:"reason"`
+		Cleared       []string   `json:"cleared"`
+		CooldownUntil *time.Time `json:"cooldown_until"`
 	}
 	if json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&result) != nil {
 		return unknown
 	}
-	if result.Reason == "stamp_indeterminate" || result.Reason == "reset_unconfirmed" {
+	reason := ""
+	if claudeResetKnownReasons[result.Reason] {
+		reason = result.Reason
+	}
+	if reason == "stamp_indeterminate" || reason == "reset_unconfirmed" {
 		return unknown
 	}
 	switch result.Result {
-	case "reset", "already_used", "not_limited", "cooldown", "ineligible":
-		return &ClaudeResetOutcome{Outcome: result.Result}
+	case ClaudeResetOutcomeReset, ClaudeResetOutcomeAlreadyUsed, ClaudeResetOutcomeNotLimited, ClaudeResetOutcomeCooldown, ClaudeResetOutcomeIneligible:
+		out := &ClaudeResetOutcome{Outcome: result.Result, Reason: reason, CooldownUntil: result.CooldownUntil}
+		for _, w := range result.Cleared {
+			if claudeResetKnownWindows[w] {
+				out.Cleared = append(out.Cleared, w)
+			}
+		}
+		return out
+	case "unavailable":
+		return &ClaudeResetOutcome{Outcome: ClaudeResetOutcomeUnknown, Reason: claudeResetReasonUnavailable}
 	default:
 		return unknown
 	}
-}
-
-func (s *ClaudeResetCreditService) persistFence(ctx context.Context, id int64, marker claudePendingClaim) error {
-	body, err := json.Marshal(marker)
-	if err != nil {
-		return err
-	}
-	return s.idempotency.repo.MarkSucceeded(ctx, id, http.StatusOK, string(body), s.now().AddDate(100, 0, 0))
 }

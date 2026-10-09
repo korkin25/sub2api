@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"testing"
 
@@ -226,23 +227,56 @@ func TestAdminServiceCreateAccountUsesOffWhenConfigIsNil(t *testing.T) {
 	require.Equal(t, false, account.Extra[openAIOAuthResponsesWebsocketsV2EnabledKey])
 }
 
-func TestAdminServiceCreateAccountPreservesLegacyOpenAIWebsocketFalseOnOAuth(t *testing.T) {
-	repo := &longContextBillingRepoStub{}
-	svc := &adminServiceImpl{
-		cfg:         &config.Config{Gateway: config.GatewayConfig{OpenAIWS: config.GatewayOpenAIWSConfig{OAuthResponsesWebsocketsV2ModeDefault: OpenAIWSIngressModePassthrough}}},
-		accountRepo: repo,
+func TestAdminServiceCreateAccountPreservesLegacyOpenAIWebsocketFlagsOnOAuth(t *testing.T) {
+	for _, key := range []string{openAIOAuthResponsesWebsocketsV2EnabledKey, "responses_websockets_v2_enabled", "openai_ws_enabled"} {
+		for _, enabled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s=%t", key, enabled), func(t *testing.T) {
+				repo := &longContextBillingRepoStub{}
+				svc := &adminServiceImpl{
+					cfg:         &config.Config{Gateway: config.GatewayConfig{OpenAIWS: config.GatewayOpenAIWSConfig{OAuthResponsesWebsocketsV2ModeDefault: OpenAIWSIngressModePassthrough}}},
+					accountRepo: repo,
+				}
+				account, err := svc.CreateAccount(context.Background(), &CreateAccountInput{
+					Platform:             PlatformOpenAI,
+					Type:                 AccountTypeOAuth,
+					Extra:                map[string]any{key: enabled},
+					SkipDefaultGroupBind: true,
+				})
+				require.NoError(t, err)
+				require.Equal(t, enabled, account.Extra[key])
+				require.NotContains(t, account.Extra, openAIOAuthResponsesWebsocketsV2ModeKey)
+				want := OpenAIWSIngressModeOff
+				if enabled {
+					want = OpenAIWSIngressModeCtxPool
+				}
+				require.Equal(t, want, account.ResolveOpenAIResponsesWebSocketV2Mode(OpenAIWSIngressModePassthrough))
+			})
+		}
 	}
+}
 
-	account, err := svc.CreateAccount(context.Background(), &CreateAccountInput{
-		Platform:             PlatformOpenAI,
-		Type:                 AccountTypeOAuth,
-		Extra:                map[string]any{"responses_websockets_v2_enabled": false},
-		SkipDefaultGroupBind: true,
-	})
-
-	require.NoError(t, err)
-	require.Equal(t, false, account.Extra["responses_websockets_v2_enabled"])
-	require.NotContains(t, account.Extra, openAIOAuthResponsesWebsocketsV2ModeKey)
+func TestAdminServiceUpdateAccountDoesNotApplyOAuthWebsocketCreationDefault(t *testing.T) {
+	for _, existingMode := range []string{"", OpenAIWSIngressModeOff, OpenAIWSIngressModeHTTPBridge} {
+		t.Run("existing="+existingMode, func(t *testing.T) {
+			extra := map[string]any{}
+			if existingMode != "" {
+				extra[openAIOAuthResponsesWebsocketsV2ModeKey] = existingMode
+			}
+			repo := &longContextBillingRepoStub{account: &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Extra: extra}}
+			svc := &adminServiceImpl{
+				cfg:         &config.Config{Gateway: config.GatewayConfig{OpenAIWS: config.GatewayOpenAIWSConfig{OAuthResponsesWebsocketsV2ModeDefault: OpenAIWSIngressModePassthrough}}},
+				accountRepo: repo,
+			}
+			account, err := svc.UpdateAccount(context.Background(), 1, &UpdateAccountInput{Name: "renamed"})
+			require.NoError(t, err)
+			if existingMode == "" {
+				require.NotContains(t, account.Extra, openAIOAuthResponsesWebsocketsV2ModeKey)
+			} else {
+				require.Equal(t, existingMode, account.Extra[openAIOAuthResponsesWebsocketsV2ModeKey])
+			}
+			require.NotContains(t, account.Extra, openAIOAuthResponsesWebsocketsV2EnabledKey)
+		})
+	}
 }
 
 func TestAdminServiceCreateAccountRejectsMalformedOpenAILongContextBillingValue(t *testing.T) {
